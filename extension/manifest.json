@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "WB Competitor Parser",
+  "version": "1.18",
+  "permissions": ["activeTab", "scripting", "storage", "tabs"],
+  "host_permissions": [
+    "https://www.wildberries.ru/*",
+    "http://localhost:8765/*",
+    "http://31.130.204.146:8000/*",
+    "http://31.130.204.146:3000/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.wildberries.ru/*"],
+      "js": ["hook_wb_api.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://www.wildberries.ru/catalog/*/detail.aspx*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.wildberries.ru/*"],
+      "js": ["content_shelf.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.wildberries.ru/*"],
+      "js": ["content_search.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.wildberries.ru/*"],
+      "js": ["content_captcha.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
