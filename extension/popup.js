@@ -17,13 +17,56 @@ const categorySelect = document.getElementById("categorySelect");
 let categoryFilters = [];
 let captchaNotice = "";
 
+// ── Шапка / настройки / онбординг ──
+const onboardView = document.getElementById("onboardView");
+const onboardInput = document.getElementById("onboardInput");
+const onboardSaveBtn = document.getElementById("onboardSaveBtn");
+const mainView = document.getElementById("mainView");
+const connEl = document.getElementById("connEl");
+const connText = document.getElementById("connText");
+const gearBtn = document.getElementById("gearBtn");
+const settingsBox = document.getElementById("settingsBox");
+
+// ── Глобальная строка «что сейчас работает» ──
+const globalRunEl = document.getElementById("globalRun");
+const globalWhatEl = document.getElementById("globalWhat");
+const globalEtaEl = document.getElementById("globalEta");
+const globalStopBtn = document.getElementById("globalStopBtn");
+const colCap = document.getElementById("colCap");
+const colSearch = document.getElementById("colSearch");
+
 function captchaHtml() {
   return captchaNotice
-    ? `<div style="margin-bottom:6px;padding:5px 7px;border-radius:6px;background:#fdecea;color:#b71c1c;font-weight:600;line-height:1.3">${captchaNotice}</div>`
+    ? `<div class="captcha">${captchaNotice}</div>`
     : "";
 }
 
-// === Коллектор текущей карточки (Ш8) ===
+// ── Онбординг: пока нет токена — показываем только его ввод ──
+function showOnboard(on) {
+  onboardView.style.display = on ? "block" : "none";
+  mainView.style.display = on ? "none" : "block";
+}
+
+onboardSaveBtn.onclick = async () => {
+  const t = (onboardInput.value || "").trim();
+  if (!t) return; // пустой токен не сохраняем — онбординг остаётся
+  await chrome.storage.local.set({ extToken: t });
+  showOnboard(false);
+  await loadSettingsIntoForm();
+  await refreshAll();
+};
+
+gearBtn.onclick = () => settingsBox.classList.toggle("show");
+
+// Клик по индикатору подключения тоже открывает настройки
+connEl.onclick = () => settingsBox.classList.toggle("show");
+
+function setConn(ok, text) {
+  connEl.classList.toggle("bad", !ok);
+  connText.textContent = text || (ok ? "Подключено" : "Нет связи");
+}
+
+// ── Коллектор текущей карточки (Ш8) ──
 const autoCaptureEl = document.getElementById("autoCapture");
 const capBtn = document.getElementById("capBtn");
 const recapBtn = document.getElementById("recapBtn");
@@ -59,9 +102,9 @@ async function refreshCapStatus() {
   const r = await tabMessage({ type: "WB_CAP_STATE" });
   let text;
   if (r.error) text = r.error;
-  else if (!r.nm) text = "не карточка WB";
+  else if (!r.nm) text = "Это не страница карточки";
   else if (!r.state) text = `nm ${r.nm}: ещё не собрано`;
-  else if (r.state.reason === "own_card") text = `nm ${r.nm}: ваша карточка (кнопкой — в обход)`;
+  else if (r.state.reason === "own_card") text = `nm ${r.nm}: ваша карточка — соберите вручную кнопкой`;
   else if (r.state.reason === "fresh") text = `nm ${r.nm}: уже собрано`;
   else text = `nm ${r.nm}: сохранено (${r.state.desc || 0} симв., ${r.state.chars || 0} хар-к)`;
   if (cnt) text += ` · за сессию: ${cnt}`;
@@ -79,16 +122,14 @@ async function capRun(force) {
   await refreshCapStatus();
 }
 
-if (capBtn) capBtn.onclick = () => capRun(false);
-if (recapBtn) recapBtn.onclick = () => capRun(true);
-if (autoCaptureEl) {
-  chrome.storage.local.get({ autoCapture: true }, (s) => {
-    autoCaptureEl.checked = !!s.autoCapture;
-  });
-  autoCaptureEl.onchange = () => {
-    chrome.storage.local.set({ autoCapture: autoCaptureEl.checked });
-  };
-}
+capBtn.onclick = () => capRun(false);
+recapBtn.onclick = () => capRun(true);
+chrome.storage.local.get({ autoCapture: true }, (s) => {
+  autoCaptureEl.checked = !!s.autoCapture;
+});
+autoCaptureEl.onchange = () => {
+  chrome.storage.local.set({ autoCapture: autoCaptureEl.checked });
+};
 
 
 async function settings() {
@@ -133,27 +174,31 @@ async function loadFilters(savedId) {
   }
 }
 
-if (categorySelect) {
-  categorySelect.onchange = async () => {
-    try { await chrome.storage.local.set({ categoryId: categorySelect.value || "" }); } catch {}
-  };
-}
+categorySelect.onchange = async () => {
+  try { await chrome.storage.local.set({ categoryId: categorySelect.value || "" }); } catch {}
+};
 
-if (saveSettingsBtn) {
-  saveSettingsBtn.onclick = async () => {
-    await chrome.storage.local.set({
-      server: (serverInput.value || "").trim() || DEFAULT_SERVER,
-      extToken: (tokenInput.value || "").trim(),
-    });
-    await refreshStatus();
-    await refreshSearchStatus();
-  };
-}
+saveSettingsBtn.onclick = async () => {
+  await chrome.storage.local.set({
+    server: (serverInput.value || "").trim() || DEFAULT_SERVER,
+    extToken: (tokenInput.value || "").trim(),
+  });
+  await refreshStatus();
+  await refreshSearchStatus();
+};
 
 function setProgress(id, done, total) {
   const el = document.getElementById(id);
   const pct = total ? Math.round((done / total) * 100) : 0;
   el.style.width = pct + "%";
+}
+
+function statusRows(el, rows) {
+  el.innerHTML =
+    captchaHtml() +
+    rows.map(([label, val, cls]) =>
+      `<div class="k">${label} <b class="${cls}">${val}</b></div>`
+    ).join("");
 }
 
 async function refreshStatus() {
@@ -163,7 +208,7 @@ async function refreshStatus() {
     if (v) url += `?nm_id=${v}`;
     const r = await api(url);
     if (r.status === 401 || r.status === 403) {
-      statusEl.textContent = "Нет доступа: введите токен выше и нажмите ОК";
+      statusEl.innerHTML = "Нет доступа: проверьте токен в ⚙";
       return;
     }
     const d = await r.json();
@@ -171,14 +216,14 @@ async function refreshStatus() {
     const pending = d.pending || 0;
     const need = d.need_update || 0;
     const processing = d.processing || 0;
-    statusEl.innerHTML =
-      captchaHtml() +
-      `Всего: <b>${d.total}</b><br>` +
-      `Новые: <span class="pending">${pending}</span><br>` +
-      `Обновление: <span class="pending">${need}</span><br>` +
-      `В работе: <span class="pending">${processing}</span><br>` +
-      `Обработано: <span class="done">${d.done || 0}</span><br>` +
-      `Ошибки: <span class="error">${d.error || 0}</span>`;
+    statusRows(statusEl, [
+      ["Всего", d.total],
+      ["Новые", pending, "pending"],
+      ["Обновление", need, "pending"],
+      ["В работе", processing, "pending"],
+      ["Обработано", d.done || 0, "done"],
+      ["Ошибки", d.error || 0, "error"],
+    ]);
     startBtn.disabled = mode === "refresh"
       ? need === 0
       : mode === "all"
@@ -190,8 +235,10 @@ async function refreshStatus() {
         ? pending + need + processing + (d.done || 0)
         : pending + processing + (d.done || 0);
     setProgress("progressEnrich", d.done || 0, totalForMode);
+    setConn(true);
   } catch {
     statusEl.textContent = "Сервер недоступен";
+    setConn(false);
   }
 }
 
@@ -203,21 +250,23 @@ async function refreshSearchStatus() {
     if (v) url += `&nm_id=${v}`;
     const r = await api(url);
     if (r.status === 401 || r.status === 403) {
-      searchStatusEl.textContent = "Нет доступа: введите токен выше и нажмите ОК";
+      searchStatusEl.innerHTML = "Нет доступа: проверьте токен в ⚙";
       return;
     }
     const d = await r.json();
-    searchStatusEl.innerHTML =
-      captchaHtml() +
-      `Всего: <b>${d.total}</b><br>` +
-      `В очереди: <span class="pending">${d.pending || 0}</span><br>` +
-      `В работе: <span class="pending">${d.processing || 0}</span><br>` +
-      `Обработано: <span class="done">${d.done || 0}</span><br>` +
-      `Ошибки: <span class="error">${d.error || 0}</span>`;
+    statusRows(searchStatusEl, [
+      ["Всего", d.total],
+      ["В очереди", d.pending || 0, "pending"],
+      ["В работе", d.processing || 0, "pending"],
+      ["Обработано", d.done || 0, "done"],
+      ["Ошибки", d.error || 0, "error"],
+    ]);
     searchStartBtn.disabled = d.pending === 0;
     setProgress("progressSearch", d.done || 0, d.total || 0);
+    setConn(true);
   } catch {
     searchStatusEl.textContent = "Сервер недоступен";
+    setConn(false);
   }
 }
 
@@ -243,6 +292,10 @@ startBtn.onclick = () => {
   captchaNotice = "";
   startBtn.disabled = true;
   stopBtn.disabled = false;
+  // Одновременно работает один режим: поиск глушит background, тут приводим
+  // его кнопки в исходное состояние.
+  searchStopBtn.disabled = true;
+  searchStartBtn.disabled = false;
   const v = nmInput.value.trim();
   chrome.runtime.sendMessage({
     type: "START",
@@ -250,6 +303,8 @@ startBtn.onclick = () => {
     mode: collectModeEl ? collectModeEl.value : "new",
   });
 };
+
+let stopAll = () => {};
 
 stopBtn.onclick = () => {
   stopBtn.disabled = true;
@@ -260,6 +315,9 @@ searchStartBtn.onclick = () => {
   captchaNotice = "";
   searchStartBtn.disabled = true;
   searchStopBtn.disabled = false;
+  // Одновременно работает один режим: очередь карточек глушит background.
+  stopBtn.disabled = true;
+  startBtn.disabled = false;
   const v = nmInput.value.trim();
   const source = document.getElementById("searchSource").value;
   const picked = categoryFilters.find(f => String(f.id) === categorySelect.value);
@@ -270,6 +328,107 @@ searchStopBtn.onclick = () => {
   searchStopBtn.disabled = true;
   chrome.runtime.sendMessage({ type: "SEARCH_STOP" });
 };
+
+// «Стоп всё» — глушим оба потока сразу
+stopAll = () => {
+  chrome.runtime.sendMessage({ type: "STOP" });
+  chrome.runtime.sendMessage({ type: "SEARCH_STOP" });
+  stopBtn.disabled = true;
+  searchStopBtn.disabled = true;
+};
+globalStopBtn.onclick = stopAll;
+
+// === ПРОГРЕСС СБОРА ===
+// Читаем из storage.session (background туда пишет): обработано X из Y,
+// что собираем сейчас и сколько примерно осталось.
+// Версия расширения — рядом с заголовком (в шапке)
+try {
+  const verEl = document.getElementById("verTag");
+  if (verEl) verEl.textContent = "v" + chrome.runtime.getManifest().version;
+} catch {}
+
+// Имя токена: спрашиваем сервер, кто мы (ext_tokens.name)
+async function refreshTokenName() {
+  const a = document.getElementById("tokenName");
+  const b = document.getElementById("tokenName2");
+  const set = (v) => { if (a) a.textContent = v; if (b) b.textContent = v; };
+  try {
+    const r = await api("/api/ext/whoami");
+    if (r.status !== 200) { set("—"); return; }
+    const d = await r.json();
+    set(d && d.name ? d.name : "без имени");
+  } catch {
+    set("—");
+  }
+}
+
+// «глазик»: показать / скрыть сам токен
+function bindTokenEye() {
+  const btn = document.getElementById("tokenEyeBtn");
+  const inp = document.getElementById("tokenInput");
+  if (!btn || !inp || btn.dataset.bound) return;
+  btn.dataset.bound = "1";
+  btn.addEventListener("click", () => {
+    const show = inp.type === "password";
+    inp.type = show ? "text" : "password";
+    btn.textContent = show ? "🙈" : "👁";
+    btn.title = show ? "Скрыть токен" : "Показать токен";
+    try { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); } catch {}
+  });
+}
+
+const PROGRESS_KEY = "collectProgress";
+const enrichProgressEl = document.getElementById("enrichProgress");
+const searchProgressEl = document.getElementById("searchProgress");
+
+function etaText(prog) {
+  if (!prog || !prog.total || !prog.done || !prog.startedAt) return "";
+  const per = (Date.now() - prog.startedAt) / prog.done;
+  const left = Math.max(0, (prog.total - prog.done) * per);
+  const min = Math.round(left / 60000);
+  if (min < 1) return "осталось меньше минуты";
+  if (min < 60) return `осталось ~${min} мин`;
+  return `осталось ~${Math.round(min / 60)} ч`;
+}
+
+function progressLine(prog, mode) {
+  if (!prog || prog.mode !== mode) return "";
+  if (prog.finished) return `Готово: обработано ${prog.done || 0} из ${prog.total || 0}`;
+  const parts = [];
+  if (prog.total) parts.push(`обработано ${prog.done || 0} из ${prog.total}`);
+  if (prog.current) parts.push(`сейчас: ${prog.current}`);
+  const eta = etaText(prog);
+  if (eta) parts.push(eta);
+  return parts.join(" · ");
+}
+
+async function renderProgress() {
+  let prog = {};
+  try {
+    prog = (await chrome.storage.session.get({ [PROGRESS_KEY]: {} }))[PROGRESS_KEY] || {};
+  } catch {}
+  const e = progressLine(prog, "enrich");
+  const s = progressLine(prog, "search");
+  if (enrichProgressEl) enrichProgressEl.textContent = e;
+  if (searchProgressEl) searchProgressEl.textContent = s;
+
+  // глобальная строка + подсветка работающей колонки
+  const running = !prog.finished && (prog.mode === "enrich" || prog.mode === "search");
+  globalRunEl.classList.toggle("on", running);
+  if (running) {
+    globalWhatEl.textContent = prog.mode === "enrich" ? "Работает: сбор карточек" : "Работает: поиск";
+    globalEtaEl.textContent = progressLine(prog, prog.mode);
+  }
+  colCap.classList.toggle("working", running && prog.mode === "enrich");
+  colSearch.classList.toggle("working", running && prog.mode === "search");
+}
+
+// прогресс обновляем, пока попап открыт
+setInterval(renderProgress, 2000);
+renderProgress();
+bindTokenEye();
+refreshTokenName();
+setInterval(refreshTokenName, 15000);
 
 document.getElementById("resetEnrichBtn").onclick = async () => {
   const v = nmInput.value.trim();
@@ -291,6 +450,10 @@ document.getElementById("resetSearchBtn").onclick = async () => {
   await refreshSearchStatus();
 };
 
+function refreshAll() {
+  return Promise.all([refreshStatus(), refreshSearchStatus(), refreshCapStatus()]);
+}
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "DONE") {
     startBtn.disabled = true;
@@ -305,8 +468,11 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === "CAPTCHA") {
     captchaNotice = "WB показал капчу. Решите её в открытой вкладке и запустите снова.";
-    stopBtn.disabled = true;
-    searchStopBtn.disabled = true;
+    // Останавливаются кнопки только потока, который капча реально погасила
+    // (background присылает stopped per-flow).
+    const stopped = (msg.data && msg.data.stopped) || {};
+    if (stopped.enrich !== false) stopBtn.disabled = true;
+    if (stopped.search !== false) searchStopBtn.disabled = true;
     refreshStatus();
     refreshSearchStatus();
   }
@@ -315,19 +481,39 @@ chrome.runtime.onMessage.addListener((msg) => {
 document.getElementById("searchSource").addEventListener("change", refreshSearchStatus);
 nmInput.addEventListener("input", () => { refreshStatus(); refreshSearchStatus(); });
 
-if (collectModeEl) {
-  chrome.storage.local.get({ collectMode: "new" }, (s) => {
-    collectModeEl.value = s.collectMode || "new";
-    refreshStatus();
-  });
-  collectModeEl.addEventListener("change", () => {
-    chrome.storage.local.set({ collectMode: collectModeEl.value || "new" });
-    refreshStatus();
+chrome.storage.local.get({ collectMode: "new" }, (s) => {
+  collectModeEl.value = s.collectMode || "new";
+  refreshStatus();
+});
+collectModeEl.addEventListener("change", () => {
+  chrome.storage.local.set({ collectMode: collectModeEl.value || "new" });
+  refreshStatus();
+});
+
+// Плашка «обновите расширение»: сервер сообщил, что его контракт новее нашего.
+const updateBanner = document.getElementById("updateBanner");
+function refreshUpdateBanner() {
+  if (!updateBanner) return;
+  chrome.storage.local.get({ extUpdate: null, extToken: "" }, (s) => {
+    const u = s && s.extUpdate;
+    if (u && u.needed && s.extToken) {
+      updateBanner.style.display = "block";
+      updateBanner.title = `сервер ждёт контракт ${u.server}, у нас ${u.mine}`;
+    } else {
+      updateBanner.style.display = "none";
+    }
   });
 }
 
-// авто-обновление прогресса пока попап открыт + бейдж
-setInterval(() => { refreshStatus(); refreshSearchStatus(); refreshCapStatus(); }, 2000);
+// авто-обновление: статусы, сбор, онбординг
+setInterval(async () => {
+  const s = await chrome.storage.local.get({ extToken: "" });
+  showOnboard(!s.extToken);
+  if (!s.extToken) return;
+  refreshStatus();
+  refreshSearchStatus();
+  refreshCapStatus();
+}, 2000);
 
 chrome.action.getBadgeText({}).then((t) => {
   if (t === "CAP") {
@@ -339,4 +525,13 @@ chrome.action.getBadgeText({}).then((t) => {
   }
 }).catch(() => {});
 
-loadSettingsIntoForm().then(() => { refreshStatus(); refreshSearchStatus(); refreshCapStatus(); });
+async function init() {
+  const s = await chrome.storage.local.get({ extToken: "" });
+  showOnboard(!s.extToken);
+  if (s.extToken) {
+    await loadSettingsIntoForm();
+    await refreshAll();
+  }
+  refreshUpdateBanner();
+}
+init();

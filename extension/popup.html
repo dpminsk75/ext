@@ -1,103 +1,220 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', sans-serif; width: 320px; padding: 12px; background: #fafafa; }
-  h1 { font-size: 14px; margin-bottom: 10px; color: #333; }
+  body { font-family: 'Segoe UI', sans-serif; width: 640px; padding: 14px; background: #fafafa; color: #333; }
+
+  /* ── Общая шапка ── */
+  .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .top h1 { font-size: 14px; flex: 1; }
+  .conn { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #15803d; font-weight: 600; cursor: pointer;
+          background: #fff; border: 1px solid #ddd; border-radius: 12px; padding: 3px 10px; white-space: nowrap; }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; }
+  .conn.bad { color: #b91c1c; }
+  .conn.bad .dot { background: #ef4444; }
+  .gear { font-size: 15px; line-height: 1; cursor: pointer; background: none; border: none; color: #555; }
+  .gear:hover { color: #cb11ab; }
+  /* версия расшишения — рядом с заголовком */
+  .ver { font-size: 10px; color: #9ca3af; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 2px 7px; }
+  /* имя токена в шапке */
+  .tok { font-size: 11px; color: #4b5563; background: #fff; border: 1px solid #ddd; border-radius: 12px; padding: 3px 10px; white-space: nowrap; }
+  .tok b { color: #111827; }
+  /* «глазик» — показать/скрыть токен */
+  .eye { flex: 0 0 auto; padding: 6px 10px; background: #eee; color: #333; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .eye:hover { background: #e2e8f0; }
+
+  /* автосбор в шапке */
+  .check { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #333; cursor: pointer; white-space: nowrap; }
+  .check input { flex: 0 0 auto; }
+
+  /* настройки внутри ⚙ */
+  .settings { display: none; background: #fff; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 10px; margin-bottom: 10px; gap: 6px; flex-wrap: wrap; }
+  .settings.show { display: flex; }
+  .settings input { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 11px; min-width: 160px; }
+  .settings .lbl { width: 100%; font-size: 10px; color: #888; }
+
+  /* ── Глобальный статус: что сейчас работает ── */
+  #globalRun { display: none; align-items: center; gap: 10px; background: #fdf2f8; border: 1px solid #f9c6ec;
+               border-radius: 6px; padding: 7px 10px; margin-bottom: 10px; font-size: 11px; }
+  #globalRun.on { display: flex; }
+  #globalRun .spin { width: 12px; height: 12px; border: 2px solid #f9c6ec; border-top-color: #cb11ab; border-radius: 50%;
+                     animation: sp 1s linear infinite; flex: 0 0 auto; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  #globalWhat { font-weight: 700; color: #9d0b88; }
+  #globalEta { color: #666; }
+  #globalRun .spacer { flex: 1; }
+
+  /* ── Онбординг: нет токена ── */
+  .onboard { display: none; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 18px; text-align: center; }
+  .onboard.show { display: block; }
+  .onboard h2 { font-size: 13px; margin-bottom: 4px; }
+  .onboard p { font-size: 11px; color: #666; margin-bottom: 10px; line-height: 1.5; }
+  .onboard input { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; margin-bottom: 8px; text-align: center; }
+
+  /* ── Две колонки ── */
+  .cols { display: flex; gap: 10px; }
+  .col { flex: 1; min-width: 0; }
+  .col h2 { font-size: 12px; margin-bottom: 8px; padding-bottom: 5px; border-bottom: 2px solid #eee;
+            display: flex; align-items: center; gap: 6px; }
+  .col.working h2 { color: #cb11ab; border-bottom-color: #cb11ab; }
+  .col .badge { display: none; font-size: 9px; color: #cb11ab; }
+  .col.working .badge { display: inline; }
+
   .row { display: flex; gap: 6px; margin-bottom: 8px; }
-  input { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
-  button { padding: 6px 12px; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  input, select { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 11px; min-width: 0; }
+  button { padding: 6px 12px; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; white-space: nowrap; }
   .btn-primary { background: #cb11ab; color: #fff; }
   .btn-primary:hover { background: #b01095; }
   .btn-success { background: #2e7d32; color: #fff; }
-  .btn-success:hover { background: #1b5e20; }
+  .btn-secondary { background: #eee; color: #333; }
+  .btn-secondary:hover { background: #e0e0e0; }
   .btn-danger { background: #e53935; color: #fff; }
-  .btn-danger:hover { background: #c62828; }
-  .btn:disabled { opacity: 0.5; cursor: default; }
-  .status { background: #fff; border: 1px solid #ddd; border-radius: 4px; padding: 8px; font-size: 11px; margin-top: 8px; line-height: 1.6; }
+  .btn-warn { background: #ff9800; color: #fff; font-size: 10px; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .grow { flex: 1; }
+
+  .status { background: #fff; border: 1px solid #ddd; border-radius: 4px; padding: 7px 9px; font-size: 11px; margin-top: 8px; line-height: 1.8; }
+  .status .k { color: #555; display: flex; justify-content: space-between; }
+  .status .k b { font-variant-numeric: tabular-nums; }
   .done { color: #2e7d32; }
   .pending { color: #f57f17; }
   .error { color: #c62828; }
+  .captcha { margin: 0 0 6px; padding: 5px 7px; border-radius: 6px; background: #fdecea; color: #b71c1c; font-weight: 600; line-height: 1.3; font-size: 11px; }
+
   .divider { border-top: 1px solid #ddd; margin: 10px 0; }
   .progress { height: 6px; background: #eee; border-radius: 3px; margin-top: 6px; overflow: hidden; }
   .progress-bar { height: 100%; background: #cb11ab; width: 0%; transition: width 0.3s; }
   .progress-bar.search { background: #2e7d32; }
   .hint { font-size: 10px; color: #6b7280; line-height: 1.4; margin: 0 0 3px; }
+  .hint.progress { font-size: 11px; color: #374151; margin-top: 4px; }
+
+  .banner { display: none; background: #fff4e5; border: 1px solid #f0a04b; border-radius: 4px; padding: 8px; font-size: 11px;
+            line-height: 1.5; margin-bottom: 10px; color: #7a3d00; }
+  .banner a { color: #b3541e; font-weight: 600; }
 </style>
 </head>
 <body>
-  <h1>WB Competitor Parser</h1>
-
-  <div class="row">
-    <input id="serverInput" placeholder="http://хост:8000" title="Адрес бэка (подставлен при скачивании)">
-  </div>
-  <div class="row">
-    <input id="tokenInput" type="password" placeholder="ext_... токен из карточки компании" title="Токен выдаётся в карточке компании, хранится только тут">
-    <button id="saveSettingsBtn" class="btn btn-primary" title="Сохранить адрес и токен">ОК</button>
-  </div>
-  <div class="divider"></div>
-
-  <div class="row">
-    <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#333;flex:1;cursor:pointer;">
-      <input type="checkbox" id="autoCapture" checked style="flex:0 0 auto;">
-      Собирать открытые карточки
-    </label>
-  </div>
-  <div class="row">
-    <button id="capBtn" class="btn btn-primary" style="flex:1;">Собрать текущую</button>
-    <button id="recapBtn" class="btn" style="background:#eee;color:#333;" title="Игнорировать кэш 24 ч">↻ Пересобрать</button>
-  </div>
-  <div class="status" id="capStatus">—</div>
-  <div class="divider"></div>
-
-  <div class="row">
-    <input id="nmId" type="number" placeholder="source nmID (пусто = все)">
-    <button id="seedBtn" class="btn btn-primary">Очередь</button>
-  </div>
-  <div class="row">
-    <select id="collectMode" style="flex:1; padding:6px 8px; border:1px solid #ccc; border-radius:4px; font-size:11px;" title="Что собирать в режиме «Старт»">
-      <option value="new">Новые (срочно)</option>
-      <option value="refresh">Обновление старых</option>
-      <option value="all">Всё подряд</option>
-    </select>
-  </div>
-  <div class="row">
-    <button id="startBtn" class="btn btn-primary" disabled>Старт</button>
-    <button id="stopBtn" class="btn btn-danger" disabled>Стоп</button>
-  </div>
-  <div class="status" id="status">загрузка...</div>
-  <div class="progress"><div class="progress-bar" id="progressEnrich"></div></div>
-  <div class="row" style="margin-top:4px;">
-    <button id="resetEnrichBtn" class="btn" style="background:#ff9800;color:#fff;font-size:10px;" title="Вернуть в pending ошибки и зависшие processing">Сброс ошибок/зависших</button>
+  <div class="banner" id="updateBanner">
+    ⚠ <b>Обновите расширение</b>: у вас устаревшая версия — данные могут записываться неверно.
+    <a href="http://31.130.204.146:3000/ext/install" target="_blank" rel="noopener">Переустановить</a>
   </div>
 
-  <div class="divider"></div>
+  <!-- ── Онбординг: показываем, пока не задан токен ── -->
+  <div class="onboard" id="onboardView">
+    <h2>SelBI parser</h2>
+    <p>Вставьте токен из карточки компании (начинается с <b>ext_</b>).<br>Токен хранится только в этом браузере.</p>
+    <input id="onboardInput" placeholder="ext_... вставьте токен сюда">
+    <button id="onboardSaveBtn" class="btn-primary grow">Сохранить</button>
+  </div>
 
-  <div class="row">
-    <select id="categorySelect" style="flex:1; padding:6px 8px; border:1px solid #ccc; border-radius:4px; font-size:11px;" title="Фильтр категорий из админки (xsubject выдачи WB)">
-      <option value="">Без фильтра</option>
-    </select>
-  </div>
-  <div class="hint">Источник поиска — в т.ч. «Запросы конкурентов»</div>
-  <div class="row">
-    <select id="searchSource" style="flex:1; padding:6px 8px; border:1px solid #ccc; border-radius:4px; font-size:11px;" title="Для нового потока выберите «Запросы конкурентов»">
-      <option value="seo">По фразам из карточки</option>
-      <option value="report">ТОП-20 поисковых фраз</option>
-      <option value="compquery">Запросы конкурентов</option>
-      <option value="both">SEO + ТОП-20</option>
-    </select>
-  </div>
-  <div class="row">
-    <button id="searchStartBtn" class="btn btn-success" disabled>Поиск</button>
-    <button id="searchStopBtn" class="btn btn-danger" disabled>Стоп</button>
-  </div>
-  <div class="hint">Поиск собирает только список. Описания — «Очередь» → «Старт» вверху.</div>
-  <div class="status" id="searchStatus">загрузка...</div>
-  <div class="progress"><div class="progress-bar search" id="progressSearch"></div></div>
-  <div class="row" style="margin-top:4px;">
-    <button id="resetSearchBtn" class="btn" style="background:#ff9800;color:#fff;font-size:10px;">Сброс ошибок поиска</button>
+  <!-- ── Основной вид ── -->
+  <div id="mainView" style="display:none;">
+
+    <div class="top">
+      <h1>SelBI parser</h1>
+      <span class="ver" id="verTag" title="Версия расширения">v—</span>
+      <label class="check" title="Собирать данные автоматически, когда открыта страница карточки">
+        <input type="checkbox" id="autoCapture" checked>Автосбор открытых страниц
+      </label>
+      <span class="conn" id="connEl" title="Связь с сервером. Клик — настройки подключения"><span class="dot"></span><span id="connText">Подключено</span></span>
+      <span class="tok" id="tokenTag" title="Токен расширения (имя из карточки компании)">Токен: <b id="tokenName">—</b></span>
+      <button class="gear" id="gearBtn" title="Адрес сервера и токен">⚙</button>
+    </div>
+
+    <div class="settings" id="settingsBox">
+      <div class="lbl">Адрес сервера:</div>
+      <input id="serverInput" placeholder="http://хост:8000" title="Адрес бэка (подставлен при скачивании)">
+      <div class="lbl">Токен: <span id="tokenName2">—</span></div>
+      <div class="row" style="margin-bottom:8px;">
+        <input id="tokenInput" type="password" placeholder="ext_... токен из карточки компании" title="Токен выдаётся в карточке компании, хранится только тут">
+        <button id="tokenEyeBtn" class="eye" title="Показать / скрыть токен">👁</button>
+      </div>
+      <button id="saveSettingsBtn" class="btn-primary">ОК</button>
+    </div>
+
+    <div id="globalRun">
+      <div class="spin"></div>
+      <span id="globalWhat"></span>
+      <span id="globalEta"></span>
+      <span class="spacer"></span>
+      <button id="globalStopBtn" class="btn-danger" style="font-size:10px; padding:4px 10px;">Стоп всё</button>
+    </div>
+
+    <!-- ── Общее для обеих колонок: список карточек ── -->
+    <div class="hint" style="margin-bottom:3px;">Список карточек — общий для «Карточек» и «Поиска». Задайте артикул источника, если нужен только он.</div>
+    <div class="row" style="margin-bottom:10px;">
+      <input id="nmId" type="number" placeholder="Артикул WB источника (пусто — все)" style="flex:2;">
+      <button id="seedBtn" class="btn-primary" title="Запросить у сервера список карточек для сборки" style="flex:0 0 auto; font-size:11px;">Получить список</button>
+    </div>
+
+    <div class="cols">
+      <!-- ══ Колонка: Карточки ══ -->
+      <div class="col" id="colCap">
+        <h2>Карточки <span class="badge">● работает</span></h2>
+
+        <div class="row">
+          <button id="capBtn" class="btn-primary grow">Собрать текущую</button>
+          <button id="recapBtn" class="btn-secondary" title="Игнорировать кэш 24 ч">↻ Пересобрать</button>
+        </div>
+        <div class="status" id="capStatus" style="margin-top:0;">—</div>
+
+        <div class="divider"></div>
+
+        <div class="row">
+          <select id="collectMode" title="Что собирать">
+            <option value="new">Только новые</option>
+            <option value="refresh">Обновить старые</option>
+            <option value="all">Всё</option>
+          </select>
+        </div>
+        <div class="row">
+          <button id="startBtn" class="btn-primary grow" disabled>Старт</button>
+          <button id="stopBtn" class="btn-danger grow" disabled>Стоп</button>
+        </div>
+
+        <div class="status" id="status">загрузка...</div>
+        <div class="progress"><div class="progress-bar" id="progressEnrich"></div></div>
+        <div class="hint progress" id="enrichProgress"></div>
+        <div class="row" style="margin-top:4px;">
+          <button id="resetEnrichBtn" class="btn-warn grow" title="Вернуть в pending ошибки и зависшие processing">Сброс ошибок / зависших</button>
+        </div>
+      </div>
+
+      <!-- ══ Колонка: Поиск ══ -->
+      <div class="col" id="colSearch">
+        <h2>Поиск</h2>
+
+        <div class="row">
+          <select id="categorySelect" title="Фильтр категорий из админки (xsubject выдачи WB)">
+            <option value="">Без фильтра</option>
+          </select>
+        </div>
+        <div class="hint">Источник поиска — в т.ч. «Запросы конкурентов»</div>
+        <div class="row">
+          <select id="searchSource" title="Для нового потока выберите «Запросы конкурентов»">
+            <option value="seo">По фразам из карточки</option>
+            <option value="report">ТОП-20 поисковых фраз</option>
+            <option value="compquery">Запросы конкурентов</option>
+            <option value="phrases">Поисковые фразы</option>
+            <option value="both">SEO + ТОП-20</option>
+          </select>
+        </div>
+        <div class="row">
+          <button id="searchStartBtn" class="btn-success grow" disabled>Поиск</button>
+          <button id="searchStopBtn" class="btn-danger grow" disabled>Стоп</button>
+        </div>
+        <div class="hint">Поиск собирает только запросы. Описания — «Получить список» вверху → «Старт» в колонке «Карточки».</div>
+
+        <div class="status" id="searchStatus">загрузка...</div>
+        <div class="progress"><div class="progress-bar search" id="progressSearch"></div></div>
+        <div class="hint progress" id="searchProgress"></div>
+        <div class="row" style="margin-top:4px;">
+          <button id="resetSearchBtn" class="btn-warn grow">Сброс ошибок поиска</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="popup.js"></script>
