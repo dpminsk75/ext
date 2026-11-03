@@ -9,19 +9,23 @@
 //   search  -> WB_SEARCH_JSON_V1  (как раньше: /__internal/u-search/exactmatch/?resultset=catalog)
 //   shelf   -> WB_SHELF_JSON_V1   (u-recom/v9, u-card/cards/vX/list,
 //                                  meta/duplicates/vX, api-wibes/esearch)
+//   raw     -> WB_SEARCH_RAW_V1   (сырой ответ как пришёл: фильтры выдачи,
+//                                  баннеры/полки ПОИСКА, подсказки WB)
 // Конверты прокидываются в content_*.js через window.postMessage (JSON-строка)
 // и через CustomEvent на document (запасной канал).
 (() => {
   const SEARCH_MARK = "WB_SEARCH_JSON_V1";
   const SHELF_MARK = "WB_SHELF_JSON_V1";
+  const RAW_MARK = "WB_SEARCH_RAW_V1";
   const STATE_MARK = "WB_SHELF_SENT_V1";
   const DUMP_MARK = "WB_SHELF_DUMP_V1";
-  const HOOK_VER = "1.18";
+  const HOOK_VER = "1.19";
   const MAX_LOG = 30;
 
   // Диагностика для консоли (MAIN world — видно из devtools без переключения контекста).
   const log = [];
-  const recent = []; // последние конверты: content_shelf может стартовать позже первого запроса
+  const recent = []; // последние конверты полок: content_shelf может стартовать позже первого запроса
+  const recentRaw = []; // последние сырые ответы выдачи — то же для content_search
   try {
     window.__WB_SHELF_LOG__ = log;
     window.__WB_SHELF_SENT__ = [];
@@ -38,6 +42,13 @@
     return /[?&]resultset=catalog(&|$)/i.test(s);
   }
 
+  // Фильтры выдачи — тот же путь u-search, но resultset=filters.
+  function isFilters(url) {
+    const s = String(url || "");
+    if (!/\/__internal\/u-search\/exactmatch\//i.test(s)) return false;
+    return /[?&]resultset=filters(&|$)/i.test(s);
+  }
+
   // ⚠️ u-recom тоже приходит с resultset=catalog — поэтому classify проверяет
   // u-search ПЕРВЫМ и только потом остальные пути (иначе поиск сломается).
   // Привязки к /__internal/ нет: часть запросов WB уходит на другие хосты
@@ -46,6 +57,11 @@
     const s = String(url || "");
     if (!s) return null;
     if (isCatalog(s)) return { ch: "search" };
+    if (isFilters(s)) return { ch: "raw", kind: "filters" };
+    // баннеры и полки В ПОИСКЕ (не полки карточки — это u-recom/u-card выше)
+    if (/\/banners\/shelfs\/search/i.test(s)) return { ch: "raw", kind: "shelfs" };
+    // подсказки/связанные запросы WB (при наборе в поиске)
+    if (/\/u-search-tags\//i.test(s)) return { ch: "raw", kind: "suggest" };
     if (/\/u-recom\/recom\/.*?\/v\d+\/search/i.test(s)) return { ch: "shelf", kind: "recom" };
     if (/\/u-card\/cards\/v\d+\/list/i.test(s)) return { ch: "shelf", kind: "list" };
     if (/\/meta\/duplicates\/.*?\/v\d+\/search/i.test(s)) return { ch: "shelf", kind: "duplicates" };
@@ -89,6 +105,12 @@
     return out;
   }
 
+  // Фраза запроса из URL (у всех внутренних эндпоинтов есть query=).
+  function queryParam(url, name) {
+    const q = qs(url)[name];
+    return typeof q === "string" ? q : "";
+  }
+
   // null вместо 0: 0 — валидное значение (matchId: 0), но "нет поля" ≠ 0.
   function num(v) {
     if (v === null || v === undefined || v === "") return null;
@@ -99,6 +121,24 @@
   function kop(v) {
     const n = num(v);
     return n === null ? null : Math.round(n / 100);
+  }
+
+  // ---------- ресейл (товар от частного лица) ----------
+  // Признак из JSON-каталога WB: у ресейла supplier_flags=12224,
+  // sale_conditions=1074790400, dtype_mask=4096. У издательств/магазинов эти
+  // поля другие (проверено на выдаче 2026-10-25..27: 31 карточка / 26
+  // продавцов — все с личными именами; ни у одного магазина таких значений нет).
+  const RESALE_SUPPLIER_FLAGS = 12224;
+  const RESALE_SALE_CONDITIONS = 1074790400;
+  const RESALE_DTYPE_MASK = 4096;
+
+  function isResaleProduct(p) {
+    if (!p) return false;
+    return (
+      (Number(p.supplierFlags) || 0) === RESALE_SUPPLIER_FLAGS &&
+      (Number(p.saleConditions) || 0) === RESALE_SALE_CONDITIONS &&
+      (Number(p.dtypeMask) || 0) === RESALE_DTYPE_MASK
+    );
   }
 
   // ---------- поиск (как было) ----------
@@ -119,6 +159,11 @@
         reviews: Number(p.feedbacks) || 0,
         promo_id: Number(p.panelPromoId) || 0,
         is_new: !!p.isNew,
+        // ресейл (товар от частного лица) — по нему карточку не парсим
+        supplier_flags: Number(p.supplierFlags) || 0,
+        sale_conditions: Number(p.saleConditions) || 0,
+        dtype_mask: Number(p.dtypeMask) || 0,
+        is_resale: isResaleProduct(p),
         // цены WB в копейках: product — после скидки продавца, basic — до скидки
         price_u: Number(pr.product) || 0,
         old_price_u: Number(pr.basic) || 0,
@@ -127,15 +172,47 @@
     return out;
   }
 
-  function emitSearch(data) {
+  function emitSearch(url, data, rawText) {
     let items;
     try {
       items = compact(data);
     } catch {
-      return;
+      items = [];
     }
-    if (!items.length) return;
-    send(SEARCH_MARK, { type: SEARCH_MARK, items });
+    const env = { type: SEARCH_MARK, items, url: String(url || "").slice(0, 2000) };
+    // Фраза, к которой относится ответ (из query= в URL) — по ней и привязываем.
+    env.query = queryParam(url, "query");
+    // Сырой ответ каталога — сохраняем как пришёл (файл на сервере).
+    if (rawText) env.raw = rawText;
+    if (!items.length && !env.raw) return;
+    send(SEARCH_MARK, env);
+    try {
+      console.log(
+        `[WB-SEARCH] ${env.url.split("?")[0]} items=${items.length}` +
+          ` raw=${rawText ? Math.round(rawText.length / 1024) + " КБ" : "НЕТ"}`
+      );
+    } catch {}
+  }
+
+  // ---------- сырые ответы выдачи (фильтры/баннеры/подсказки) ----------
+  // Отдаём тело ответа как пришло — разбор на сервере (Python), файл = байт-в-байт.
+  function emitRaw(kind, url, rawText) {
+    if (!rawText) return;
+    const env = {
+      type: RAW_MARK,
+      kind,
+      url: String(url || "").slice(0, 2000),
+      // Фраза, к которой относится ответ (из query= в URL) — по ней и привязываем.
+      query: queryParam(url, "query"),
+      raw: rawText,
+      at: new Date().toISOString(),
+    };
+    recentRaw.push(env);
+    if (recentRaw.length > 6) recentRaw.shift();
+    send(RAW_MARK, env);
+    try {
+      console.log(`[WB-RAW] ${kind} ${env.url.split("?")[0]} ${rawText.length} байт`);
+    } catch {}
   }
 
   // ---------- полки / дубликаты ----------
@@ -288,7 +365,7 @@
     return m ? Number(m[1]) : 0;
   }
 
-  function emitShelf(kind, url, data) {
+  function emitShelf(kind, url, data, rawText) {
     const params = qs(url);
     const page = num(params.page) || 1;
     const md = (data && data.metadata) || {};
@@ -373,6 +450,12 @@
     pushLog(env);
     recent.push(env);
     if (recent.length > 10) recent.shift();
+    // Сырой ответ полки карточки (u-recom) — отдельным каналом на сервер:
+    // файл нужен, чтобы позже переразобрать блок без нового захода на карточку.
+    // В payload полок он не влезает (лимит 3,5 МБ на весь запрос).
+    if ((kind === "recom" || kind === "list") && rawText) {
+      env.raw = String(rawText).slice(0, 900000);
+    }
     send(SHELF_MARK, env);
   }
 
@@ -413,7 +496,7 @@
     } catch {}
   }
 
-  function handle(url, data) {
+  function handle(url, data, rawText) {
     recordApi(url, data);
     const c = classify(url);
     if (!c) {
@@ -428,8 +511,9 @@
       } catch {}
       return;
     }
-    if (c.ch === "search") emitSearch(data);
-    else emitShelf(c.kind, url, data);
+    if (c.ch === "search") emitSearch(url, data, rawText);
+    else if (c.ch === "raw") emitRaw(c.kind, url, rawText);
+    else emitShelf(c.kind, url, data, rawText);
   }
 
   // content_shelf.js присылает сюда сводку «что реально ушло на сервер»,
@@ -465,6 +549,11 @@
         send(SHELF_MARK, env);
       } catch {}
     }
+    for (const env of recentRaw) {
+      try {
+        send(RAW_MARK, env);
+      } catch {}
+    }
   };
   try {
     window.__WB_SHELF_REPLAY__ = replay;
@@ -472,7 +561,7 @@
   } catch {}
 
   try {
-    console.log(`[WB-HOOK] v${HOOK_VER} channels: search+shelf`);
+    console.log(`[WB-HOOK] v${HOOK_VER} channels: search+shelf+raw`);
   } catch {}
 
   // --- fetch ---
@@ -484,7 +573,8 @@
         try {
           const u = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
           if (classify(u)) {
-            // clone делаем ДО того, как страница прочитает тело ответа
+            // clone делаем ДО того, как страница прочитает тело ответа.
+            // Читаем текстом (не json), чтобы сохранить ответ «как пришёл».
             p.then((r) => {
               try {
                 return r.clone();
@@ -492,7 +582,18 @@
                 return null;
               }
             })
-              .then((c) => (c ? c.json().then((d) => handle(u, d)).catch(() => {}) : null))
+              .then((c) =>
+                c
+                  ? c
+                      .text()
+                      .then((txt) => {
+                        try {
+                          handle(u, JSON.parse(txt), txt);
+                        } catch {}
+                      })
+                      .catch(() => {})
+                  : null
+              )
               .catch(() => {});
           }
         } catch {}
@@ -520,7 +621,11 @@
               let txt = "";
               if (this.responseType === "" || this.responseType === "text") txt = this.responseText;
               else if (this.responseType === "json") txt = JSON.stringify(this.response);
-              if (txt) handle(this.__wbUrl, JSON.parse(txt));
+              if (txt) {
+                try {
+                  handle(this.__wbUrl, JSON.parse(txt), txt);
+                } catch {}
+              }
             } catch {}
           });
         }

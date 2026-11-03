@@ -1,20 +1,45 @@
-const DEFAULT_SERVER = "http://31.130.204.146:8000";
+const DEFAULT_SERVER = "https://www.selbi.top";
 const DEBUG = false;
 
 // Паузы между карточками/запросами. WB быстро отдаёт капчу, если долбить его
 // подряд: 32 карточки по 0.5 с — гарантированный WBAAS-бан. Рандом сбивает
 // ровный ритм и выглядит как живой пользователь.
-const SEARCH_GAP_MS = [9000, 16000];
-const ENRICH_GAP_MS = [5000, 10000];
+// Значения задаются в popup (⚙, секунды), ключи gapSearchMin/Max и
+// gapEnrichMin/Max в storage.local. Меняются на лету, задний цикл не надо
+// перезапускать — на следующем шаге возьмётся уже новый интервал.
+const GAP_DEFAULTS = { gapSearchMin: 9, gapSearchMax: 16, gapEnrichMin: 5, gapEnrichMax: 10 };
+let gaps = { ...GAP_DEFAULTS };
+
+// Число ≥ 1, плохое значение → дефолт. Пользователь может задать большие паузы,
+// но не нулевые — иначе снова долбит и банит.
+function gapVal(v, dflt) {
+  const n = Math.round(Number(v));
+  return isFinite(n) && n >= 1 ? n : dflt;
+}
+function loadGaps() {
+  chrome.storage.local.get(GAP_DEFAULTS).then((s) => {
+    gaps = {
+      gapSearchMin: gapVal(s.gapSearchMin, GAP_DEFAULTS.gapSearchMin),
+      gapEnrichMin: gapVal(s.gapEnrichMin, GAP_DEFAULTS.gapEnrichMin),
+    };
+    gaps.gapSearchMax = Math.max(gaps.gapSearchMin, gapVal(s.gapSearchMax, GAP_DEFAULTS.gapSearchMax));
+    gaps.gapEnrichMax = Math.max(gaps.gapEnrichMin, gapVal(s.gapEnrichMax, GAP_DEFAULTS.gapEnrichMax));
+  }).catch(() => {});
+}
+chrome.storage.onChanged.addListener((ch, area) => {
+  if (area !== "local") return;
+  if (ch.gapSearchMin || ch.gapSearchMax || ch.gapEnrichMin || ch.gapEnrichMax) loadGaps();
+});
+loadGaps();
 
 function rnd(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 function searchGap() {
-  return rnd(SEARCH_GAP_MS[0], SEARCH_GAP_MS[1]);
+  return rnd(gaps.gapSearchMin * 1000, gaps.gapSearchMax * 1000);
 }
 function enrichGap() {
-  return rnd(ENRICH_GAP_MS[0], ENRICH_GAP_MS[1]);
+  return rnd(gaps.gapEnrichMin * 1000, gaps.gapEnrichMax * 1000);
 }
 
 // Настройки (SERVER + Bearer ext-токена) лежат в chrome.storage.local —
@@ -67,7 +92,7 @@ function checkContract(res) {
       contractWarned++;
       console.warn(
         `[EXT] ⚠ сервер ждёт контракт ${srv || "?"}, у нас ${EXT_CONTRACT} — ` +
-          `обновите расширение (http://31.130.204.146:3000/ext/install)`
+          `обновите расширение (https://www.selbi.top/ext/install)`
       );
     }
   } catch {}
@@ -99,9 +124,58 @@ const everOwnTabs = new Set();
 // Записи не чистим по закрытию вкладки: позднее сообщение от уже закрытой вкладки
 // не должно превратиться в «ручной поиск».
 const handledTabs = new Set();
+
+// === Скролл-досбор картинок выдачи ===
+// WB рисует миниатюры лениво (top видимой области) и догружает пагинацию только
+// при прокрутке. После первого посыла вкладку поиска НЕ закрываем сразу:
+// командуем контенту доскроллить до ТОП-40 и ждём второй WB_SEARCH_RESULT
+// (апдейт) или таймаут — потом закрываем вкладку и берём следующую фразу.
+const SEARCH_SCROLL_WAIT_MS = 12000;
+let searchAwaitTabs = new Set();   // tabId — ждём апдейт с картинками
+const searchScrollTimers = new Map(); // tabId -> таймер завершения
+const searchUpdateCtx = new Map(); // tabId -> {queue_id, nm_id, phrase, source, stamp}
+
+function dropAwaitTab(id) {
+  const t = searchScrollTimers.get(id);
+  if (t) { clearTimeout(t); searchScrollTimers.delete(id); }
+  searchAwaitTabs.delete(id);
+  searchUpdateCtx.delete(id);
+}
+
+const SEARCH_SCROLL_CMD_MS = SEARCH_SCROLL_WAIT_MS - 2000;
+
+async function armScrollUpdate(tId, ctx) {
+  searchAwaitTabs.add(tId);
+  searchUpdateCtx.set(tId, ctx || {});
+  searchScrollTimers.set(tId, setTimeout(() => void finishSearchUpdate(tId), SEARCH_SCROLL_WAIT_MS));
+  try {
+    await chrome.tabs.sendMessage(tId, { type: "WB_SEARCH_SCROLL", maxMs: SEARCH_SCROLL_CMD_MS });
+  } catch (e) {
+    console.log("[SEARCH] команда скролл-досбора не доставлена:", String(e));
+  }
+  try { await saveLoopState(); } catch {}
+}
+
+// Апдейт доехал или окно кончилось: закрываем вкладку и берём следующую фразу
+async function finishSearchUpdate(tId) {
+  const t = searchScrollTimers.get(tId);
+  if (t) { clearTimeout(t); searchScrollTimers.delete(tId); }
+  if (!searchAwaitTabs.has(tId)) return;
+  searchAwaitTabs.delete(tId);
+  searchUpdateCtx.delete(tId);
+  if (!DEBUG) {
+    try { await chrome.tabs.remove(tId); } catch {}
+  }
+  ownTabs.delete(tId);
+  everOwnTabs.delete(tId);
+  await saveLoopState();
+  if (searching && !DEBUG) setTimeout(searchNext, searchGap());
+}
+
 try {
   chrome.tabs.onRemoved.addListener((id) => {
     ownTabs.delete(id);
+    dropAwaitTab(id);
   });
 } catch {}
 
@@ -119,6 +193,7 @@ async function saveLoopState() {
       loopState: {
         searchQueue,
         ownTabs: [...ownTabs], handled: [...handledTabs],
+        awaitTabs: [...searchAwaitTabs], updateCtx: [...searchUpdateCtx],
       },
     });
   } catch {}
@@ -149,6 +224,18 @@ async function restoreLoopState() {
         if ([...ownTabs.values()].includes("search")) armSearchWatchdog();
         else await reportSearchError();
       }
+      // Ждали апдейт картинок, а SW перезапустился: вкладки живы — окно ожидания
+      // заново и повторная команда скролла (прошлая могла потеряться).
+      for (const [id, ctx] of st.updateCtx || []) {
+        if (!ownTabs.has(id)) continue;
+        searchAwaitTabs.add(id);
+        searchUpdateCtx.set(id, ctx);
+        searchScrollTimers.set(id, setTimeout(() => void finishSearchUpdate(id), SEARCH_SCROLL_WAIT_MS));
+        try {
+          await chrome.tabs.sendMessage(id, { type: "WB_SEARCH_SCROLL", maxMs: SEARCH_SCROLL_CMD_MS });
+        } catch {}
+      }
+      for (const id of st.awaitTabs || []) searchAwaitTabs.add(id);
     }
   } catch {}
   try {
@@ -233,11 +320,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(msg.data || {}),
     }).catch((e) => console.error("[ENRICH] отчёт об ошибке не отправлен:", e));
+    // Вкладку с неудачной карточкой закрываем: пока она открыта, processNext()
+    // считает, что мы «ждём результат», и не берёт следующую карточку — цикл
+    // вставал на несуществующих/битых карточках.
+    const badTab = sender && sender.tab && sender.tab.id;
+    if (badTab) {
+      ownTabs.delete(badTab);
+      everOwnTabs.delete(badTab);
+      try { chrome.tabs.remove(badTab); } catch {}
+    }
+    if (currentEnrichNm && Number(msg.data && msg.data.nm_id) === currentEnrichNm) {
+      currentEnrichNm = null;
+    }
+    bumpRunDone();
+    if (enrichWatchdog) { clearTimeout(enrichWatchdog); enrichWatchdog = null; }
+    if (running && !DEBUG) setTimeout(processNext, enrichGap());
+    try { sendResponse({ ok: true }); } catch {}
   }
   if (msg.type === "CAPTURE") {
     doCapture(msg)
       .then((res) => sendResponse(res))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
+  if (msg.type === "CAP_STATE") {
+    capState(msg.nm_id)
+      .then((res) => sendResponse(res || null))
+      .catch(() => sendResponse(null));
     return true;
   }
   if (msg.type === "WB_SEARCH_RESULT") {
@@ -252,8 +361,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, status: 0, error: String(e) }));
     return true;
   }
+  if (msg.type === "WB_SHELF_RAW") {
+    // Сырой ответ полки карточки (u-recom) — на сервер отдельным запросом:
+    // сервер сохранит файл (нужен, чтобы переразобрать блок позже).
+    sendShelfRaw(msg.data)
+      .then((res) => sendResponse(res))
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
   if (msg.type === "WB_SEARCH_RAW") {
-    sendSearchRaw(msg.data)
+    // Своя search-вкладка фонового потока: помечаем сырые ответы карточкой
+    // очереди (source_nm_id), чтобы сервер свёл JSON-запись выдачи в ТЕ ЖЕ
+    // строки, что и DOM-запись /search_result (единый список источников).
+    // Ручной поиск человека не метим — там привязка "наши карточки в выдаче".
+    const rawTab = sender && sender.tab && sender.tab.id;
+    let rawQueueNm = 0;
+    if (rawTab && ownTabs.get(rawTab) === "search") {
+      if (searchQueue && normPhrase(searchQueue.phrase || "") === normPhrase(msg.data && msg.data.phrase)) {
+        rawQueueNm = searchQueue.nm_id || 0;
+      } else {
+        const rawCtx = searchUpdateCtx.get(rawTab);
+        if (rawCtx) rawQueueNm = rawCtx.nm_id || 0;
+      }
+    }
+    sendSearchRaw(rawQueueNm ? { ...msg.data, source_nm_id: rawQueueNm } : msg.data)
       .then((res) => sendResponse(res))
       .catch((e) => sendResponse({ ok: false, status: 0, error: String(e) }));
     return true;
@@ -294,7 +425,7 @@ async function startCollectLoop(msg) {
   await stopSearchLoop();
   running = true;
   enrichNmId = msg.nm_id || null;
-  collectMode = ["new", "refresh", "all"].includes(msg.mode) ? msg.mode : "new";
+  collectMode = ["new", "refresh", "all", "watch"].includes(msg.mode) ? msg.mode : "new";
   await beginRun("enrich");
   clearCaptchaNotice();
   await closeOwnTabs("enrich");
@@ -428,25 +559,36 @@ async function bumpCapCount() {
     const s = await chrome.storage.session.get({ capCount: 0 });
     const n = (s.capCount || 0) + 1;
     await chrome.storage.session.set({ capCount: n });
-    {
-      const prog = await getProgress();
-      let done = n;
-      let total = prog.baseTotal || 0;
-      try {
-        const st = await api("/api/ext/status");
-        const d = await st.json();
-        done = Math.max(0, (d.done || 0) - (prog.baseDone || 0));
-        if (!total) total = (d.pending || 0) + (d.processing || 0);
-      } catch {}
-      await setProgress({ mode: "enrich", done, total });
-      setProgressBadge(done, total, false);
-    }
+    // счётчики прогресса обновляет поллер (по состоянию очереди на сервере)
     if (!running && !searching) setBadge(String(n), "#2e7d32");
   } catch {}
 }
 
-// Явная кнопка «Собрать в WB CMS»: explicit=1 снимает is_hidden (§8.5).
+// Состояние карточки ДО сбора: исключена ли она из сбора для нашей компании.
+// Раньше состояние жило в sessionStorage и заполнялось только ПОСЛЕ ответа
+// сервера — исключённую карточку успевали открыть и прокрутить.
+async function capState(nm_id) {
+  if (!nm_id) return null;
+  try {
+    const r = await api(`/api/ext/cap_state?nm_id=${encodeURIComponent(nm_id)}`);
+    if (r.status !== 200) return null;
+    return await r.json().catch(() => null);
+  } catch (e) {
+    console.warn("[CAP] cap_state не получен:", e);
+    return null;
+  }
+}
+
+// Явная кнопка «Собрать в WB CMS»: explicit=1 — клик пользователя (в т.ч. пересборка).
 async function doCapture(msg) {
+  const nm = msg && msg.data && msg.data.nm_id;
+  const st = await capState(nm);
+  if (st && st.hidden) {
+    return {
+      ok: true, skipped: true,
+      result: { skipped: true, reason: "hidden", nm_id: Number(nm) || 0 },
+    };
+  }
   return captureNow(msg.data, { explicit: true, force: !!msg.force, allow_own: !!msg.allow_own });
 }
 
@@ -465,7 +607,8 @@ async function observeCard(data) {
       return;
     }
     const res = await r.json().catch(() => null);
-    console.log("[OBSERVE] capture →", r.status, JSON.stringify(res));
+    console.log("[OBSERVE] capture →", r.status,
+      `sold_out ${data.sold_out}`, JSON.stringify(res));
     if (res && !res.skipped) await bumpCapCount();
   } catch (e) {
     console.error("[OBSERVE] observe failed:", e);
@@ -737,6 +880,35 @@ async function sendShelves(data) {
   return out;
 }
 
+/** Сырой ответ полки карточки → /api/ext/shelves-raw (сервер пишет файл). */
+async function sendShelfRaw(data) {
+  const d = data || {};
+  if (!d.raw || !d.nm_id) return { ok: false, error: "empty raw" };
+  try {
+    const r = await api("/api/ext/shelves-raw", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        nm_id: d.nm_id,
+        url: d.url || "",
+        kind: d.kind || "recom",
+        raw: d.raw,
+        stamp: d.stamp || "",
+      }),
+    });
+    if (r.status === 200) {
+      const j = await r.json().catch(() => null);
+      console.log("[SHELF] сырой ответ сохранён:", (j && j.file) || "ok");
+      return { ok: true, status: r.status, result: j };
+    }
+    console.warn("[SHELF] сырой ответ отклонён:", r.status);
+    return { ok: false, status: r.status };
+  } catch (e) {
+    console.warn("[SHELF] сырой ответ не отправлен:", e);
+    return { ok: false, status: 0, error: String(e) };
+  }
+}
+
 // === ПРОГРЕСС СБОРА ===
 // Живёт в storage.session: переживает перезапуск service worker (MV3) и
 // доступно попапу для показа «обработано X из Y · сейчас: … · осталось ~Z мин».
@@ -749,6 +921,7 @@ async function setProgress(patch) {
     const cur = (await chrome.storage.session.get({ [PROGRESS_KEY]: {} }))[PROGRESS_KEY] || {};
     const next = { ...cur, ...patch, at: Date.now() };
     await chrome.storage.session.set({ [PROGRESS_KEY]: next });
+    try { chrome.action.setTitle({ title: progressTitle(next) }); } catch {}
     // Плашка прогресса живёт только в той вкладке, из которой запустили сбор.
     const tabId = next.sourceTabId;
     if (tabId) {
@@ -758,6 +931,64 @@ async function setProgress(patch) {
   } catch {
     return null;
   }
+}
+
+// Поллер прогресса: «обработано» считаем по серверным счётчикам, от базы
+// запуска. Локальный счётчик собранных карточек для этого не годится — он
+// не связан с состоянием очереди на сервере.
+let progressTimer = null;
+async function pollProgress() {
+  try {
+    const prog = await getProgress();
+    if (!prog || !prog.mode) {
+      try { chrome.action.setTitle({ title: "SelBI parser" }); } catch {}
+      return;
+    }
+    if (prog.finished) {
+      // Готово — поллер больше не нужен (его интервал и держал SW живым).
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+      try { chrome.action.setTitle({ title: "SelBI parser" }); } catch {}
+      return;
+    }
+    const url = prog.mode === "search"
+      ? `/api/ext/search_status?source=${searchSource || "seo"}`
+      : enrichStatusUrl();
+    const r = await api(url);
+    if (r.status !== 200) return;
+    const d = await r.json();
+    // «в очереди» — сколько ждёт сейчас (сервер), «обработано» — локальный
+    // счётчик этого запуска (его не сбивает пересев очереди).
+    const total = (d.pending || 0) + (d.processing || 0);
+    const done = prog.done || 0;
+    await setProgress({ total });
+    setProgressBadge(done, total, false);
+  } catch {}
+}
+
+// Тултип иконки: что сейчас делает расширение (прогресс видно при наведении).
+function progressTitle(prog) {
+  const base = "SelBI parser";
+  if (!prog || !prog.mode) return base;
+  const mode = prog.mode === "enrich" ? "сбор карточек" : "поиск";
+  if (prog.finished) return `${base} — ${mode}: готово, обработано ${prog.done || 0}`;
+  const parts = [`${base} — ${mode}: обработано ${prog.done || 0}`];
+  if (prog.total) parts.push(`в очереди ${prog.total}`);
+  if (prog.current) parts.push(`сейчас: ${prog.current}`);
+  return parts.join(" · ");
+}
+
+// +1 к «обработано» текущего запуска (успех, ошибка или таймаут карточки)
+async function bumpRunDone() {
+  try {
+    const prog = await getProgress();
+    await setProgress({ done: (prog.done || 0) + 1 });
+  } catch {}
+}
+
+function startProgressPoller() {
+  if (progressTimer) return;
+  progressTimer = setInterval(pollProgress, 5000);
+  pollProgress();
 }
 
 // Начало запуска: запоминаем вкладку-источник (та, что была активна под курсором)
@@ -773,7 +1004,7 @@ async function beginRun(mode, source) {
   try {
     const url = mode === "search"
       ? `/api/ext/search_status?source=${source}`
-      : "/api/ext/status";
+      : enrichStatusUrl();
     const r = await api(url);
     const d = await r.json();
     baseDone = d.done || 0;
@@ -790,6 +1021,7 @@ async function beginRun(mode, source) {
     startedAt: Date.now(),
     finished: false,
   });
+  startProgressPoller();
 }
 
 async function getProgress() {
@@ -859,7 +1091,7 @@ async function handleCaptcha(data, tId) {
   console.warn(
     `[CAPTCHA] во вкладке ${kind || "неизвестной"}: ${String((data && (data.phrase || data.nm)) || "")} — поток останавливается`
   );
-  try { chrome.action.setTitle({ title: "WB CMS: решите капчу в открытой вкладке" }); } catch {}
+  try { chrome.action.setTitle({ title: "SelBI parser: решите капчу в открытой вкладке" }); } catch {}
   setBadge("CAP", "#c62828");
 
   // Капчу-вкладку отдаём человеку: из ownTabs/everOwnTabs убираем, иначе
@@ -902,6 +1134,11 @@ async function handleResult(data, tId) {
   let status = 0;
   let captured = null;
   let error = "";
+  // Payload в SW-консоль: вкладка карточки закрывается сразу после сбора,
+  // а service worker живёт — отсюда видно, что реально уехало на сервер.
+  console.log("[ENRICH] result payload:",
+    `nm ${data && data.nm_id}`, `price ${data && data.price}`,
+    `sold_out ${data && data.sold_out}`);
   try {
     const r = await api("/api/ext/result", {
       method: "POST",
@@ -935,6 +1172,8 @@ async function handleResult(data, tId) {
         ` · desc ${descLen} симв · хар-к ${chrCnt}`
     );
   }
+  if (enrichWatchdog) { clearTimeout(enrichWatchdog); enrichWatchdog = null; }
+  if (status === 200 || captured) bumpRunDone();
   if (tId && ownTabs.get(tId) === "enrich" && !DEBUG) {
     try { await chrome.tabs.remove(tId); } catch {}
     ownTabs.delete(tId);
@@ -943,7 +1182,7 @@ async function handleResult(data, tId) {
   await saveLoopState();
   if (running && !DEBUG) {
     try {
-      const r = await api("/api/ext/status");
+      const r = await api(enrichStatusUrl());
       const d = await r.json();
       const cnt = collectMode === "refresh"
         ? (d.need_update || 0)
@@ -966,6 +1205,44 @@ function enrichNextUrl() {
   return `/api/ext/next?${params.toString()}`;
 }
 
+// Счётчики очереди enrich. Режим «SEO-мониторинг» (source='watch') — своя
+// очередь, общая куча конкурентов в её счётчики не входит.
+function enrichStatusUrl() {
+  return collectMode === "watch"
+    ? "/api/ext/status?source=watch"
+    : "/api/ext/status";
+}
+
+// Страховка: карточка не отчиталась за 3 минуты (WB не отрисовал, капча,
+// редирект) — считаем её битой, отчитываемся ошибкой и идём к следующей.
+let enrichWatchdog = null;
+function armEnrichWatchdog() {
+  if (enrichWatchdog) clearTimeout(enrichWatchdog);
+  enrichWatchdog = setTimeout(async () => {
+    enrichWatchdog = null;
+    if (!running) return;
+    const nm = currentEnrichNm;
+    if (!nm) return;
+    console.warn("[ENRICH] watchdog: карточка " + nm + " не отчиталась за 3 мин — пропускаем");
+    try {
+      await api("/api/ext/error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nm_id: nm, error: "таймаут сбора карточки" }),
+      });
+    } catch {}
+    for (const [id, kind] of [...ownTabs]) {
+      if (kind !== "enrich") continue;
+      ownTabs.delete(id);
+      everOwnTabs.delete(id);
+      try { await chrome.tabs.remove(id); } catch {}
+    }
+    currentEnrichNm = null;
+    bumpRunDone();
+    processNext();
+  }, 3 * 60 * 1000);
+}
+
 async function processNext() {
   if (!running) return;
   // Уже ждём результат (карточка открыта) — повторный вызов ничего не открывает.
@@ -981,14 +1258,34 @@ async function processNext() {
         const prog = await getProgress();
         const total = prog.total || 0;
         const done = prog.done || 0;
-        setProgressBadge(done, total, total > 0);
-        await setProgress({ mode: "enrich", current: "", done, total, finished: total > 0 });
+        await setProgress({ mode: "enrich", current: "", done, total, finished: true });
+        setProgressBadge(done, total, true);
       }
       await refreshIdleBadge();
       notifyPopup({ type: "DONE" });
       return;
     }
     currentEnrichNm = nm_id;
+    // Карточка исключена из сбора для нашей компании? — вкладку не открываем:
+    // сервер всё равно не обновит контент, а мы бы потратили вкладку и скролл.
+    const st = await capState(nm_id);
+    if (st && st.hidden) {
+      console.log(`[ENRICH] карточка ${nm_id} исключена из сбора — пропускаем`);
+      try {
+        await api("/api/ext/skip", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ nm_id }),
+        });
+      } catch (e) {
+        console.warn("[ENRICH] не отпустили карточку в очередь:", e);
+      }
+      currentEnrichNm = null;
+      bumpRunDone();
+      if (running && !DEBUG) setTimeout(processNext, enrichGap());
+      return;
+    }
+    armEnrichWatchdog();
     {
       const prog = await getProgress();
       await setProgress({
@@ -1034,7 +1331,9 @@ async function handleSearchResult(data, tId) {
   }
   const isOwnTab = !!(tId && ownTabs.get(tId) === "search");
   let out = { ok: false, status: 0, error: "" };
-  if (isOwnTab && handledTabs.has(tId)) {
+  // Повторный результат от вкладки — обычно дубль, НО если ждали апдейт
+  // скролл-досбора картинок — это обновление, ветка ниже (searchAwaitTabs).
+  if (isOwnTab && handledTabs.has(tId) && !searchAwaitTabs.has(tId)) {
     console.log("[SEARCH] повторный результат из вкладки расширения — игнор");
     return { ok: true, skipped: true, note: "duplicate" };
   }
@@ -1085,7 +1384,47 @@ async function handleSearchResult(data, tId) {
       console.error("[SEARCH] сохранение не отправлено:", e);
       out = { ok: false, status: 0, error: String(e) };
     }
+    // Контекст для апдейт-POST при досборе картинок (searchQueue обнуляем)
+    const updCtx = {
+      queue_id: searchQueue.queue_id,
+      nm_id: qnm,
+      phrase: searchQueue.phrase,
+      source: qsrc,
+      stamp: data.search_stamp || "",
+    };
     searchQueue = null;
+    // Дисбор картинок: держим вкладку до апдейта/таймаута. Закрывать и
+    // планировать следующую фразу будет finishSearchUpdate.
+    if (out.ok && tId && !DEBUG) {
+      await armScrollUpdate(tId, updCtx);
+    }
+  } else if (isOwnTab && searchAwaitTabs.has(tId)) {
+    // Апдейт досбора картинок (скролл): досохраняем на сервер и закрываем вкладку
+    const ctx = searchUpdateCtx.get(tId) || {};
+    console.log(`[SEARCH] апдейт досбора («${phrase}»): ${(products || []).length} позиций`);
+    try {
+      const r = await api("/api/ext/search_result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          queue_id: ctx.queue_id,
+          nm_id: ctx.nm_id,
+          phrase: ctx.phrase || phrase,
+          source: ctx.source || searchSource,
+          products,
+          search_stamp: data.search_stamp || ctx.stamp || "",
+        }),
+      });
+      if (r.status === 401 || r.status === 403) {
+        console.error("[SEARCH] апдейт отклонён:", r.status, "(проверьте токен в настройках popup)");
+      }
+      out = { ok: r.status === 200, status: r.status, saved: (products || []).length, update: true };
+    } catch (e) {
+      console.error("[SEARCH] апдейт не отправлен:", e);
+      out = { ok: false, status: 0, error: String(e) };
+    }
+    await finishSearchUpdate(tId);
+    return out;
   } else if (isOwnTab) {
     // вкладка расширения, очередь по этой фразе уже обработана — это дубль
     console.log("[SEARCH] дубль результата из вкладки расширения — игнор");
@@ -1101,12 +1440,15 @@ async function handleSearchResult(data, tId) {
   }
 
   if (isOwnTab && !DEBUG) {
-    try { await chrome.tabs.remove(tId); } catch {}
-    ownTabs.delete(tId);
-    everOwnTabs.delete(tId);
-  }
-  if (searching && !DEBUG && isOwnTab) {
-    setTimeout(searchNext, searchGap());
+    if (searchAwaitTabs.has(tId)) {
+      // ждём апдейт картинок: вкладку закроет finishSearchUpdate — он же
+      // запускает следующую фразу (searchNext)
+    } else {
+      try { await chrome.tabs.remove(tId); } catch {}
+      ownTabs.delete(tId);
+      everOwnTabs.delete(tId);
+      if (searching && !DEBUG) setTimeout(searchNext, searchGap());
+    }
   }
   await saveLoopState();
   return out;
@@ -1170,8 +1512,8 @@ async function searchNext() {
         const prog = await getProgress();
         const total = prog.total || 0;
         const done = prog.done || 0;
-        setProgressBadge(done, total, total > 0);
-        await setProgress({ mode: "search", current: "", done, total, finished: total > 0 });
+        await setProgress({ mode: "search", current: "", done, total, finished: true });
+        setProgressBadge(done, total, true);
       }
       await refreshIdleBadge();
       await saveLoopState();

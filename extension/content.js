@@ -270,14 +270,28 @@
     const out = [];
     const seen = new Set();
     const marker = `/${nmId}/images/`;
-    for (const img of document.querySelectorAll("img")) {
-      const raw = img.currentSrc || img.src || img.getAttribute("data-src-pb") || "";
-      if (!raw || !raw.includes(marker)) continue;
-      const url = raw.split("?")[0].split("#")[0].replace(/\/images\/[^/]+\//, "/images/c246x328/");
-      if (!/\/images\/c246x328\/\d+\.(webp|jpg|jpeg|png)$/i.test(url)) continue;
-      if (seen.has(url)) continue;
+    const pushUrl = (raw) => {
+      if (!raw || !String(raw).includes(marker)) return;
+      const url = String(raw).trim()
+        .split("?")[0].split("#")[0]
+        .replace(/^\/\//, "https://")
+        .replace(/\/images\/[^/]+\//, "/images/c246x328/");
+      if (!/\/images\/c246x328\/\d+\.(webp|jpg|jpeg|png)$/i.test(url)) return;
+      if (seen.has(url)) return;
       seen.add(url);
       out.push(url);
+    };
+    const pushSrcset = (v) => {
+      for (const part of String(v || "").split(",")) pushUrl(part.trim().split(/\s+/)[0]);
+    };
+    for (const img of document.querySelectorAll("img")) {
+      // srcset: «url 1x, url 2x» — может быть единственным источником до ленивой загрузки
+      pushUrl(img.currentSrc || img.src);
+      pushSrcset(img.getAttribute("srcset"));
+      pushSrcset(img.getAttribute("data-srcset"));
+      for (const attr of ["data-src", "data-src-pb", "data-original", "data-lazy-src"]) {
+        pushUrl(img.getAttribute(attr));
+      }
       if (out.length >= 30) break;
     }
     return out;
@@ -373,6 +387,38 @@
     return document.querySelector('del[class*="price"]');
   }
 
+  // «Нет в наличии» на карточке (и в выдаче — аналогичный блок): h2 soldOutProduct
+  // в priceBlock. Класс у WB с hashed-хвостом → ищем по префиксу; страховка —
+  // текст «Нет в наличии» внутри priceBlock.
+  function cardSoldOut() {
+    try {
+      const h2 = document.querySelector('h2[class*="soldOutProduct"]');
+      if (h2) {
+        const t = (h2.textContent || "").replace(/\u00a0/g, " ").toLowerCase();
+        if (/нет\s+в\s+наличии/.test(t)) return true;
+      }
+      const block = document.querySelector('[class*="priceBlock"]');
+      if (block) {
+        const t = (block.textContent || "").replace(/\u00a0/g, " ").toLowerCase();
+        return /нет\s+в\s+наличии/.test(t);
+      }
+    } catch {}
+    return false;
+  }
+
+  // Ресейл: блок «ресейл · товары от частных лиц» на странице карточки.
+  // У WB класс hashed-хвостом (resaleSummaryCardBadge--_pUAo меняется от сборки
+  // к сборке) → ищем по стабильному data-testid, страховка — по тексту.
+  function cardIsResale() {
+    try {
+      const el = document.querySelector('[data-testid="resale-summary-card-badge"]');
+      if (el) return true;
+      const alt = document.querySelector('[class*="resaleSummaryCardBadge"]');
+      if (alt) return /ресейл/i.test(alt.textContent || "");
+    } catch {}
+    return false;
+  }
+
   // Бейджи карточки товара: карусель div.badges--* → div.mo-badge → span (без data-testid).
   function collectCardBadges() {
     const out = [];
@@ -404,14 +450,26 @@
     const sellerEl = document.querySelector('[class*="sellerInfoNameDefaultText"]');
     if (sellerEl) result.seller = clean(sellerEl.textContent);
 
-    const priceEl = findCardPrice();
-    if (priceEl) result.price = parseRub(priceEl.textContent);
-    const oldEl = findCardOldPrice(priceEl);
-    if (oldEl) result.old_price = parseRub(oldEl.textContent);
+    // «Нет в наличии» проверяем ДО поиска цены: при sold-out запасной поиск
+    // «N ₽» ловит цену офферов реселлеров («Все N предложений от 2 975 ₽»),
+    // а цены WB у распроданного товара нет — пишем 0 и не ищем вовсе.
+    result.sold_out = cardSoldOut();
+    if (result.sold_out) {
+      result.price = 0;
+      result.old_price = 0;
+    } else {
+      const priceEl = findCardPrice();
+      if (priceEl) result.price = parseRub(priceEl.textContent);
+      const oldEl = findCardOldPrice(priceEl);
+      if (oldEl) result.old_price = parseRub(oldEl.textContent);
+    }
 
     result.images = parseImages(nmId);
     Object.assign(result, collectCommonInfo());
     result.badges = allBadges();
+    // Ресейл (товар от частного лица) — контент собирать нечего, карточку
+    // исключаем из сбора (сервер поставит is_hidden).
+    result.is_resale = cardIsResale();
     return result;
   }
 
@@ -431,10 +489,18 @@
     const sellerEl = document.querySelector('[class*="sellerInfoNameDefaultText"]');
     if (sellerEl) result.seller = sellerEl.textContent.trim();
 
-    const priceEl = findCardPrice();
-    if (priceEl) result.price = parseRub(priceEl.textContent);
-    const oldEl = findCardOldPrice(priceEl);
-    if (oldEl) result.old_price = parseRub(oldEl.textContent);
+    // «Нет в наличии» проверяем ДО поиска цены (см. extractVisible): иначе
+    // фолбэк «N ₽» записывает цену офферов реселлеров вместо отсутствующей цены WB.
+    result.sold_out = cardSoldOut();
+    if (result.sold_out) {
+      result.price = 0;
+      result.old_price = 0;
+    } else {
+      const priceEl = findCardPrice();
+      if (priceEl) result.price = parseRub(priceEl.textContent);
+      const oldEl = findCardOldPrice(priceEl);
+      if (oldEl) result.old_price = parseRub(oldEl.textContent);
+    }
 
     const miniSwiper = document.querySelector('[class*="miniaturesSwiper"]');
     if (miniSwiper) {
@@ -447,6 +513,8 @@
     // рейтинг / оценки / вопросы / бейджи акций — из productCommonInfo--XMAON
     Object.assign(result, collectCommonInfo());
     result.badges = allBadges();
+    // Ресейл (товар от частного лица) — описания там нет, парсить нечего.
+    result.is_resale = cardIsResale();
 
     // «Все характеристики и описание» — выдвижной drawer (ленивый). Открываем, только
     // если блока ещё нет. ВАЖНО: closeButton НЕ жмём — на новом WB эта кнопка закрывает
@@ -485,6 +553,8 @@
       rating: result.rating,
       feedbacks: result.feedbacks,
       questions: result.questions,
+      price: result.price,
+      sold_out: result.sold_out,
     });
 
     // Диагностика. ВАЖНО: content script живёт в изолированном мире, поэтому
@@ -544,9 +614,45 @@
     return result;
   }
 
+  // Попросить content_shelf.js пересканировать DOM и отправить полки СРАЗУ.
+  // Без этого вкладка закрывается (background закрывает её сразу после отчёта
+  // о сборе) раньше, чем уйдёт отправка с подписями блоков и фото — полки
+  // приходили без них.
+  async function rescanShelves() {
+    try {
+      if (!window.__WB_SHELF_READY__) return; // content_shelf.js не загружен
+    } catch {
+      return;
+    }
+    let done = false;
+    const onDone = () => {
+      done = true;
+      try {
+        window.removeEventListener("wbcm-shelf-scan-done", onDone);
+      } catch {}
+    };
+    try {
+      window.addEventListener("wbcm-shelf-scan-done", onDone);
+      window.dispatchEvent(new CustomEvent("wbcm-shelf-scan"));
+    } catch {
+      return;
+    }
+    for (let i = 0; i < 40 && !done; i++) await delay(100);
+    try {
+      window.removeEventListener("wbcm-shelf-scan-done", onDone);
+    } catch {}
+  }
+
   async function scrollToBottom() {
     let prevH = 0;
     for (let i = 0; i < 15; i++) {
+      // Страница «ничего не найдено»: скроллить нечего, снизу — карусели
+      // рекомендаций, которые подгружаются лениво (страница не «кончается»
+      // и мы ездили туда-сюда до 25 секунд на каждую битую карточку).
+      if (notFoundBlock()) {
+        window.scrollTo(0, 0);
+        return;
+      }
       window.scrollBy(0, 800);
       await delay(400);
       const curH = document.documentElement.scrollHeight;
@@ -596,6 +702,10 @@
     if (!document.body) return;
     const old = document.getElementById("wbcms-fab-host");
     if (old) old.remove();
+    // Кнопка карточки — только на странице товара: на выдаче она перекрывает
+    // кнопку «Собрать выдачу» (content_search.js). WB ходит между ними
+    // без перезагрузки (SPA), поэтому селекты по URL и в mountUI, и в watcher.
+    if (!nmFromPath()) return;
     const host = document.createElement("div");
     host.id = "wbcms-fab-host";
     // Левый верхний угол (под липкой шапкой WB); правый низ занят кнопкой «В корзину».
@@ -625,6 +735,14 @@
       re: shadow.getElementById("re"),
       hint: shadow.getElementById("hint"),
     };
+    // В режиме автосбора (вкладку открыло расширение) кнопка не нужна:
+    // человек ничего не должен нажимать, а плашка «Ваша карточка» только
+    // сбивала с толку. Прячем её.
+    try {
+      Promise.resolve(sendBG({ type: "WB_MODE" })).then((res) => {
+        if (res && res.mode === "full") host.style.display = "none";
+      });
+    } catch {}
     ui.btn.addEventListener("click", () => {
       const nm = nmFromPath();
       if (!nm) return;
@@ -651,7 +769,7 @@
     const nm = nmFromPath();
     if (!nm) { setUI("", "Собрать в WB CMS", "не карточка WB"); return; }
     const st = loadCapState(nm);
-    if (!st) { setUI("", "Собрать в WB CMS", "контент → общая база конкурентов"); return; }
+    if (!st) { setUI("", "Собрать в WB CMS", "контент → общая база конкурентов"); refreshExcludedUI(nm); return; }
     if (st.reason === "own_card") {
       setUI("own", "Ваша карточка", "клик — всё равно собрать");
     } else if (st.reason === "fresh") {
@@ -660,6 +778,27 @@
       setUI("ok", "Сохранено", `${st.desc || 0} симв. описания, ${st.chars || 0} хар-к · ${agoText(st.at)}`);
     } else {
       setUI("", "Собрать в WB CMS", "");
+    }
+    refreshExcludedUI(nm);
+  }
+
+  // Исключена ли карточка из сбора для нашей компании? — узнаём у сервера (§19.4).
+  // Локальный sessionStorage для этого не годится: он заполняется только ПОСЛЕ
+  // ответа сервера, то есть уже после того, как карточку открыли и прокрутили.
+  async function askCapState(nm) {
+    if (!nm) return null;
+    const res = await sendBG({ type: "CAP_STATE", nm_id: Number(nm) || 0 });
+    return res || null;
+  }
+
+  async function refreshExcludedUI(nm) {
+    try {
+      const st = await askCapState(nm);
+      if (!st || !st.hidden) return false;
+      setUI("err", "Исключено — не собираем", "вернуть: «Собранные карточки» на сайте");
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -677,6 +816,10 @@
     if (r.skipped && r.reason === "fresh") {
       saveCapState(nm, { at: r.collected_at || new Date().toISOString(), reason: "fresh" });
       renderCapState();
+      return;
+    }
+    if (r.skipped && r.reason === "hidden") {
+      setUI("err", "Исключено — не собираем", "вернуть: «Собранные карточки» на сайте");
       return;
     }
     saveCapState(nm, {
@@ -707,13 +850,25 @@
     try {
       if (captchaReason()) { await reportCaptcha("manual"); return null; }
       captchaSent = false;
+      // Исключена из сбора для нашей компании? — не скроллим и не собираем:
+      // сервер всё равно откажет («hidden»), а скролл уже потратил бы время.
+      if (await refreshExcludedUI(nm)) return null;
       let data = null;
       if (!force && lastRun.nm === nm && lastRun.data && Date.now() - lastRun.at < CAP_TTL_MS) {
         data = lastRun.data;
       } else {
         setUI("busy", "Собираю…", "скроллю страницу…");
+        const app = await waitForApp(10000);
+        if (cardNotFound(app)) {
+          setUI("err", "Карточка не найдена", "WB: «По Вашему запросу ничего не найдено»");
+          return null;
+        }
         await waitForElement('h2[class*="productTitle"]', 15000);
         await scrollToBottom();
+        if (cardNotFound(currentApp())) {
+          setUI("err", "Карточка не найдена", "WB: «По Вашему запросу ничего не найдено»");
+          return null;
+        }
         await waitForElement(".cards-list__container", 5000);
         window.scrollTo(0, 0);
         await delay(800);
@@ -768,12 +923,13 @@
   // Ничего не скроллим и не открываем сами — пишем только то, что человек уже открыл:
   //   базовая часть карточки → открытое описание → долистанные рекомендации.
   let passiveTimer = null;
-  const passiveSeen = { desc: false, recs: false };
+  const passiveSeen = { desc: false, recs: false, imgs: 0 };
 
   function obsKey(data) {
     return [data.price, data.old_price, data.rating, data.feedbacks, data.questions,
       (data.description || "").length, (data.characteristics || []).length,
-      (data.recommendations || []).length, (data.badges || []).join("|")].join("~");
+      (data.recommendations || []).length, (data.badges || []).join("|"),
+      (data.images || []).length].join("~");
   }
 
   async function sendObserve(nm, phase) {
@@ -794,6 +950,7 @@
       nm, price: data.price, old: data.old_price, desc: (data.description || "").length,
       chars: (data.characteristics || []).length, recs: (data.recommendations || []).length,
       rating: data.rating, fb: data.feedbacks, q: data.questions, badges: data.badges,
+      sold_out: data.sold_out,
     });
     await sendBG({ type: "WB_OBSERVE_CARD", data });
   }
@@ -806,15 +963,33 @@
     stopPassive();
     passiveSeen.desc = false;
     passiveSeen.recs = false;
+    passiveSeen.imgs = 0;
+    // Исключена из сбора для нашей компании? — не наблюдаем вовсе (сервер всё
+    // равно откажет, а парсить описание и картинки — работа впустую).
+    try {
+      const st = await askCapState(nm);
+      if (st && st.hidden) {
+        console.log("[WB-CMS] карточка исключена из сбора — наблюдение пропущено");
+        return;
+      }
+    } catch {}
     await waitForElement('h2[class*="productTitle"]', 8000);
     if (captchaReason()) { await reportCaptcha("passive"); return; }
     // базовое — сразу (то, что видно без скролла)
     await sendObserve(nm, "base");
+    passiveSeen.imgs = parseImages(nm).length;
 
     // следим: человек открыл описание / долистал до рекомендаций
     passiveTimer = setInterval(async () => {
       if (running) return;
       try {
+        // Галерея WB дорендеривается лениво: миниатюр стало больше — до-наблюдаем,
+        // иначе в деталях останется одно превью вместо полного набора.
+        const imgs = parseImages(nm).length;
+        if (imgs > passiveSeen.imgs) {
+          passiveSeen.imgs = imgs;
+          await sendObserve(nm, "base");
+        }
         if (!passiveSeen.desc) {
           const sec = findDescSection();
           if (sec && visible(sec)) {
@@ -836,6 +1011,82 @@
   }
 
   // ===================== ПОЛНЫЙ РЕЖИМ (очередь расширения) =====================
+  // Сбор не удался: репортим на сервер (/api/ext/error через background), иначе
+  // строка очереди висит в processing до 30-минутного таймаута. Вызывается только
+  // после повторной попытки (WB иногда дорисовывает страницу со второго прохода).
+  // WB-страница «По Вашему запросу ничего не найдено» — карточки нет.
+  // Раньше ждали отрисовки 2×15 сек и всё равно упирались в пустую страницу.
+  // Блок WB «По Вашему запросу ничего не найдено» — самый надёжный признак:
+// проверка по DOM (быстро, не трогает layout), в отличие от текста.
+// Скрытый шаблон WB (есть в DOM каждой страницы) не считаем — блок должен
+// быть видимым и содержать именно надпись о пустой выдаче.
+function notFoundBlock() {
+  try {
+    const el = document.querySelector(".content404");
+    if (!el) return false;
+    const rects = el.getClientRects();
+    if (!rects || !rects.length) return false;
+    const t = (el.textContent || "").replace(/\u00a0/g, " ").toLowerCase();
+    return t.includes("ничего не найдено") || t.includes("не нашлось подходящих");
+  } catch {
+    return false;
+  }
+}
+
+// ГЛАВНЫЙ ПРИЗНАК «карточки нет» — приложение WB: SPA монтируется в
+  // #reactContainers и пишет в data-current-app, что сейчас на экране:
+  //   error404                 — товара нет («По Вашему запросу ничего не найдено»)
+  //   SpaProductCardEntrypoint — карточка товара
+  // Ждём этот блок и сразу решаем: скроллить карточку или выходить, не «ловия»
+  // дальше по DOM (текст/селекторы) — вёрстка WB меняется, признак — нет.
+  const APP_ERROR_404 = "error404";
+  const APP_PRODUCT_CARD = "SpaProductCardEntrypoint";
+
+  function currentApp() {
+    try {
+      const el = document.getElementById("reactContainers");
+      return el ? String(el.getAttribute("data-current-app") || "") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  // Значение может проставиться с задержкой и смениться (карточка → error404),
+  // поэтому ждём, пока оно перестанет меняться (APP_STABLE_MS).
+  const APP_STABLE_MS = 800;
+  async function waitForApp(maxMs = 15000) {
+    const start = Date.now();
+    let last = "";
+    let since = Date.now();
+    while (Date.now() - start < maxMs) {
+      const cur = currentApp();
+      if (cur !== last) {
+        last = cur;
+        since = Date.now();
+      } else if (cur && Date.now() - since >= APP_STABLE_MS) {
+        return cur;
+      }
+      await delay(300);
+    }
+    return last;
+  }
+
+  function cardNotFound(app) {
+    // Основной признак — приложение WB; страховка — видимый блок пустой выдачи.
+    if (app) return app === APP_ERROR_404;
+    return notFoundBlock();
+  }
+
+  async function reportCollectError(nm, reason, notFound = false) {
+    console.error(`[WB-CMS] enrich error nm ${nm}: ${reason} — репортим на сервер`);
+    if (ui) setUI("err", "Сбор не удался", String(reason).slice(0, 80));
+    const data = { nm_id: nm, error: reason };
+    // «Карточки нет на WB»: WB отдал error404/content404 — сервер ставит
+    // статус 'gone' (не отдаётся в обновление до ручной проверки «Появилась»)
+    if (notFound) data.reason = "not_found";
+    await sendBG({ type: "WB_ENRICH_ERROR", data });
+  }
+
   async function run() {
     const nm = nmFromPath();
     if (!nm || running) return;
@@ -845,24 +1096,80 @@
       captchaSent = false;
       await whenVisible();
       if (captchaReason()) { await reportCaptcha("enrich"); return; }
-      await waitForElement('h2[class*="productTitle"]', 15000);
-      // скролл обязателен: без него описания/характеристик/рекомендаций нет в DOM
-      await scrollToBottom();
-      await waitForElement(".cards-list__container", 5000);
-      window.scrollTo(0, 0);
-      await delay(1000);
-      if (captchaReason()) { await reportCaptcha("enrich"); return; }
 
-      const data = await extract(nm);
-      lastRun = { nm, at: Date.now(), data };
-
-      // Пустышку на сервер не шлём: иначе в базу уедет карточка без описания и характеристик
-      // (типично для фоновой вкладки, где WB не дорисовал страницу).
-      if (!data.description && !data.characteristics.length) {
-        console.warn(`[WB-CMS v${VER}] пустой сбор nm ${nm} — не отправляю (F5 или кнопка)`);
-        if (ui) setUI("", "Собрать в WB CMS", "страница не дорисовалась — нажмите кнопку");
+      // 1) Ждём приложение WB (#reactContainers[data-current-app]) и сразу
+      //    решаем: error404 — товара нет, выходим, не скроллим.
+      const app = await waitForApp(15000);
+      if (cardNotFound(app)) {
+        console.warn(`[WB-CMS] ${nm}: WB не нашла товар (app=${app || "error404"})`);
+        await reportCollectError(nm, "карточка не найдена на WB", true);
         return;
       }
+      if (app && app !== APP_PRODUCT_CARD) {
+        // WB поменял имя приложения — собираем как карточку, но помечаем в логе.
+        console.warn(`[WB-CMS] ${nm}: незнакомое приложение WB (${app}) — собираю как карточку`);
+      }
+
+      // Сбор с одной повторной попыткой: пустышку на сервер не шлём сразу —
+      // в базу уехала бы карточка без описания/характеристик. Ошибка репортится
+      // только если пусто/сломалось и на 2-й попытке.
+      let data = null;
+      let lastErr = "";
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          // Ждём заголовок карточки, но «ничего не найдено» ловим сразу,
+          // не дожидаясь 15 секунд: надпись у WB дорисовывается позже, поэтому
+          // одноразовая проверка её могла пропустить.
+          let notFound = false;
+          let hasTitle = false;
+          for (let waited = 0; waited < 15000; waited += 300) {
+            if (cardNotFound(currentApp())) { notFound = true; break; }
+            if (document.querySelector('h2[class*="productTitle"]')) { hasTitle = true; break; }
+            await delay(300);
+          }
+          // Заголовка карточки нет и за 15 секунд — карточки тоже нет
+          // (WB на такой отдаёт «По Вашему запросу ничего не найдено»).
+          // Без этой проверки мы уходили в скролл и «ездили туда-сюда».
+          if (!notFound && !hasTitle) notFound = true;
+          if (notFound) {
+            console.warn(`[WB-CMS] карточка ${nm} не найдена на WB — выходим сразу`);
+            await reportCollectError(nm, "карточка не найдена на WB", true);
+            return;
+          }
+          // Даём WB время дорисовать страницу: сразу после появления заголовка
+          // она ещё «пустая» — ранний скролл улетает вверх, лента не подгружается
+          // и описание/рекомендации остаются неполными.
+          await delay(1000);
+          await scrollToBottom();
+          // Полки (с подписями и фото) — отправляем сейчас, до скролла наверх:
+          // вкладку закроют сразу после отчёта о сборе.
+          await rescanShelves();
+          if (cardNotFound(currentApp())) {
+            await reportCollectError(nm, "карточка не найдена на WB", true);
+            return;
+          }
+          await waitForElement(".cards-list__container", 5000);
+          window.scrollTo(0, 0);
+          await delay(1000);
+          if (captchaReason()) { await reportCaptcha("enrich"); return; }
+          data = await extract(nm);
+          if (data.description || data.characteristics.length) break;
+          lastErr = "страница не дорисовалась (пустой сбор)";
+        } catch (e) {
+          if (captchaReason()) { await reportCaptcha("enrich"); return; }
+          lastErr = String((e && e.message) || e).slice(0, 120);
+          data = null;
+        }
+        if (attempt < 2) {
+          console.warn(`[WB-CMS] попытка ${attempt} не удалась (${lastErr}) — retry через 5с`);
+          await delay(5000);
+        }
+      }
+      if (!data || (!data.description && !data.characteristics.length)) {
+        await reportCollectError(nm, lastErr || "empty collect");
+        return;
+      }
+      lastRun = { nm, at: Date.now(), data };
 
       const res = await sendBG({ type: "WB_RESULT", data });
       if (res && res.status === 200) {
@@ -887,11 +1194,18 @@
   }
 
   // SPA: WB умеет менять nm без перезагрузки — иначе всегда собиралась бы первая карточка.
-  // Заодно возвращаем кнопку, если WB перерисовал body.
+  // Заодно возвращаем кнопку, если WB перерисовал body. Кнопка карточки и кнопка
+  // выдачи живут на одном месте — показываем свою только на странице товара,
+  // иначе на выдаче она перекрывает «Собрать выдачу» (content_search.js).
   setInterval(async () => {
-    if (!document.getElementById("wbcms-fab-host") && document.body) {
-      mountUI();
-      renderCapState();
+    const fab = document.getElementById("wbcms-fab-host");
+    if (nmFromPath()) {
+      if (!fab && document.body) {
+        mountUI();
+        renderCapState();
+      }
+    } else if (fab) {
+      fab.remove();
     }
     if (location.pathname === lastPath) return;
     lastPath = location.pathname;

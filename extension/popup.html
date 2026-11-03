@@ -98,7 +98,7 @@
 <body>
   <div class="banner" id="updateBanner">
     ⚠ <b>Обновите расширение</b>: у вас устаревшая версия — данные могут записываться неверно.
-    <a href="http://31.130.204.146:3000/ext/install" target="_blank" rel="noopener">Переустановить</a>
+    <a href="https://www.selbi.top/ext/install" target="_blank" rel="noopener">Переустановить</a>
   </div>
 
   <!-- ── Онбординг: показываем, пока не задан токен ── -->
@@ -130,6 +130,21 @@
       <div class="row" style="margin-bottom:8px;">
         <input id="tokenInput" type="password" placeholder="ext_... токен из карточки компании" title="Токен выдаётся в карточке компании, хранится только тут">
         <button id="tokenEyeBtn" class="eye" title="Показать / скрыть токен">👁</button>
+      </div>
+      <div class="lbl">Пауза между поисками, сек (от / до):</div>
+      <div class="row" style="margin-bottom:6px;">
+        <input id="gapSearchMin" type="number" min="1" step="1" placeholder="от" title="Минимальная пауза между поисковыми сборами, сек">
+        <input id="gapSearchMax" type="number" min="1" step="1" placeholder="до" title="Максимальная пауза между поисковыми сборами, сек">
+      </div>
+      <div class="lbl">Пауза между карточками, сек (от / до):</div>
+      <div class="row" style="margin-bottom:6px;">
+        <input id="gapEnrichMin" type="number" min="1" step="1" placeholder="от" title="Минимальная пауза между карточками, сек">
+        <input id="gapEnrichMax" type="number" min="1" step="1" placeholder="до" title="Максимальная пауза между карточками, сек">
+      </div>
+      <div class="lbl" style="margin-bottom:2px;">Малые паузы → WB отдаёт капчу и бан. Действует со следующего шага сбора, без перезапуска. Дефолт: поиск 9–16, карточки 5–10.</div>
+      <div class="row" style="margin-bottom:8px;">
+        <span id="gapErr" class="lbl" style="color:#c62828; flex:1;"></span>
+        <button id="gapDefaultsBtn" class="eye" title="Вернуть паузы по умолчанию">По умолчанию</button>
       </div>
       <button id="saveSettingsBtn" class="btn-primary">ОК</button>
     </div>
@@ -164,6 +179,7 @@
 
         <div class="row">
           <select id="collectMode" title="Что собирать">
+            <option value="watch">Из SEO-мониторинг</option>
             <option value="new">Только новые</option>
             <option value="refresh">Обновить старые</option>
             <option value="all">Всё</option>
@@ -193,11 +209,11 @@
         </div>
         <div class="hint">Источник поиска — в т.ч. «Запросы конкурентов»</div>
         <div class="row">
-          <select id="searchSource" title="Для нового потока выберите «Запросы конкурентов»">
+          <select id="searchSource" title="Для сборки из SEO-мониторинга выберите первый пункт">
+            <option value="phrases">Из SEO-мониторинг</option>
             <option value="seo">По фразам из карточки</option>
             <option value="report">ТОП-20 поисковых фраз</option>
             <option value="compquery">Запросы конкурентов</option>
-            <option value="phrases">Поисковые фразы</option>
             <option value="both">SEO + ТОП-20</option>
           </select>
         </div>

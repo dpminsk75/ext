@@ -82,6 +82,47 @@
     }
   }
 
+  // Картинка карточки выдачи: классы WB меняются и миниатюры грузятся лениво,
+  // поэтому идём по ВСЕМ img внутри карточки (src/currentSrc/srcset/
+  // data-srcset/data-src*/data-original) и по background-image. Приоритет —
+  // ссылка с маркером `/<nm>/images/` (картинка именно этого товара, а не
+  // рекламы/полки); фолбэк — любой WB-фотохост.
+  function cardImage(card, nmId) {
+    const marker = `/${nmId}/images/`;
+    let best = "";
+    let any = "";
+    const push = (raw) => {
+      let s = String(raw || "").trim();
+      if (!s || s.startsWith("data:")) return;
+      s = s.split(/[\s,]+/)[0].split("?")[0].split("#")[0];
+      if (s.startsWith("//")) s = "https:" + s;
+      if (!/^https:/i.test(s)) return;
+      const low = s.toLowerCase();
+      if (!best && low.includes(marker)) best = s;
+      if (!any && (low.includes("/images/") || low.includes("wbbasket"))) any = s;
+    };
+    const pushSrcset = (v) => {
+      for (const part of String(v || "").split(",")) push(part.trim().split(/\s+/)[0]);
+    };
+    for (const img of card.querySelectorAll("img")) {
+      push(img.currentSrc || img.src);
+      pushSrcset(img.getAttribute("srcset"));
+      pushSrcset(img.getAttribute("data-srcset"));
+      for (const a of ["data-src", "data-src-pb", "data-original", "data-lazy-src"]) {
+        push(img.getAttribute(a));
+      }
+    }
+    if (!best && !any) {
+      // миниатюры бывают и div-ами с фоном (inline style от ленивого рендера)
+      for (const el of card.querySelectorAll("[style*=background]")) {
+        const m = /url\(["']?([^"')]+)["']?\)/i.exec(el.style.backgroundImage || "");
+        if (m) push(m[1]);
+        if (best || any) break;
+      }
+    }
+    return best || any || "";
+  }
+
   // Бейджи акций/промо: что нашли — складываем в массив строк
   const BADGE_IDS = ["saleBadge", "promoBadge", "goodPriceBadge", "cashbackBadge"];
 
@@ -126,6 +167,9 @@
     attempts = 0;
     collectedPhrase = "";
     sent = false;
+    imgStable = { t0: 0, last: -1 };
+    lastSentEmpty = -1;
+    imgRetryLeft = 0;
     setUI("", "Собрать выдачу", "выдача → позиции, цены, бейджи");
   }
 
@@ -245,7 +289,9 @@
       scheduleRawSend(150);
     }
     // Выдача догрузилась (WB подгрузил ещё товаров) → обновляем и DOM-отчёт.
-    if (added && sent) scheduleResend();
+    // Во время скролл-досбора картинок не пересылаем: финальный апдейт
+    // scrollCollect отправит сам.
+    if (added && sent && !scrollRunning) scheduleResend();
     // Ответ пришёл для новой фразы → дособираем её.
     if (switched) scheduleCollect(500);
   }
@@ -300,14 +346,62 @@
   let priceCheck = { dom: 0, eqProduct: 0, eqBasic: 0, other: 0, pct: [], samples: [] };
   let lastSkipped = 0; // сколько карточек DOM не попали в каталог JSON (реклама/полки)
 
+  // Блоки «ничего не найдено» и рекомендаций — НЕ выдача. Их карточки не должны
+  // попадать в позиции: на пустой выдаче WB рисует карусель «Хит продаж» с
+  // data-nm-id/data-card-index — без этой проверки она собиралась как выдача.
+  const NOT_MAIN_LIST =
+    ".content404, .content404__recommend, .goods-slider, .custom-slider, [class*='recommendationsCarousel']";
+  function inNotMainList(el) {
+    try {
+      return !!el.closest(NOT_MAIN_LIST);
+    } catch {
+      return false;
+    }
+  }
+
   // Карточки ТОЛЬКО основной выдачи: на странице поиска WB есть ещё брендовые
   // полки и блоки («похожие», «смотрели раньше») — их data-card-index = 0, и
   // в каталоге JSON их нет. Такие строки не пишем.
   function mainListCards() {
     const root = document.querySelector(".product-card-list");
     const sel = "article.product-card, [data-nm-id]";
-    const list = root ? Array.from(root.querySelectorAll(sel)) : Array.from(document.querySelectorAll(sel));
-    return list.filter((el) => el.hasAttribute("data-card-index"));
+    if (root) {
+      // Есть основной список — берём только его (как раньше).
+      return Array.from(root.querySelectorAll(sel)).filter((el) =>
+        el.hasAttribute("data-card-index")
+      );
+    }
+    // Списка выдачи нет (пустая выдача / страница «ничего не найдено»):
+    // в документе остаются карусели рекомендаций — их карточки выдачей не являются.
+    return Array.from(document.querySelectorAll(sel)).filter(
+      (el) => el.hasAttribute("data-card-index") && !inNotMainList(el)
+    );
+  }
+
+  // WB: «По Вашему запросу ничего не найдено» — по этому запросу товаров нет.
+  function isEmptyResult() {
+    try {
+      // 1) Блок пустой выдачи (страховка). Скрытый шаблон WB (есть в DOM каждой
+      //    страницы) не считаем — блок должен быть видимым.
+      const blk = document.querySelector(".content404");
+      if (blk) {
+        const rects = blk.getClientRects();
+        const bt = (blk.textContent || "").replace(/\u00a0/g, " ").toLowerCase();
+        if (rects && rects.length && /ничего не найдено|не нашлось подходящих/.test(bt)) return true;
+      }
+      // 2) Заголовок пустой выдачи (старая/новая вёрстка WB).
+      const head = document.querySelector(
+        ".content404__title, [class*='content404'] h1, [class*='not-found'] h1, [class*='notFound'] h1"
+      );
+      if (head && /ничего не найдено|не нашлось подходящих/i.test(head.textContent || "")) return true;
+      // 3) Старый текст WB (может быть без блока .content404).
+      const t = ((document.body && document.body.textContent) || "")
+        .replace(/\u00a0/g, " ")
+        .toLowerCase();
+      return t.includes("не нашлось подходящих товаров");
+    } catch {
+      return false;
+    }
   }
 
   function extract() {
@@ -347,8 +441,21 @@
       // цены WB API (копейки → рубли) — запасной источник, если DOM не отрисовался
       const apiPrice = api && api.price_u ? Math.round(api.price_u / 100) : 0;
       const apiOld = api && api.old_price_u ? Math.round(api.old_price_u / 100) : 0;
-      const price = domPrice || apiPrice;
-      const oldPrice = domOld || apiOld;
+
+      // «Нет в наличии»: у распроданной карточки в priceBlock PLACEHOLDER h2
+      // («Нет в наличии») вместо цены. Цену тогда не пишем — включая запасную
+      // из WB API (стоимость там есть, но покупателю её не показывают).
+      const soldOut = (() => {
+        const h2 = card.querySelector('[class*="soldOutProduct"]');
+        if (h2) {
+          const t = txt(h2).replace(/\u00a0/g, " ").toLowerCase();
+          if (/нет\s+в\s+наличии/.test(t)) return true;
+        }
+        const pb = card.querySelector('[class*="priceBlock"]');
+        return !!(pb && /нет\s+в\s+наличии/i.test((pb.textContent || "").replace(/\u00a0/g, " ")));
+      })();
+      const price = soldOut ? 0 : (domPrice || apiPrice);
+      const oldPrice = soldOut ? 0 : (domOld || apiOld);
 
       if (api && domPrice && priceCheck.dom < 400) {
         priceCheck.dom++;
@@ -376,16 +483,18 @@
         if (b && b.length <= 40 && !/https?:/i.test(b)) badges.push(b);
       }
 
+      // Ресейл (товар от частного лица): признак из JSON-каталога, который мы
+      // перехватили (api.is_resale). Такие карточки — не наши конкуренты: их не
+      // парсим, а в выдаче помечаем бейджем.
+      const isResale = !!(api && api.is_resale);
+      if (isResale && !badges.includes("ресейл")) badges.push("ресейл");
+
       // остаток («Осталось 3 шт»)
       const stock = txt(card.querySelector('[class*="thermometerText"]'));
 
-      // картинка
-      const img =
-        card.querySelector("img.j-thumbnail") ||
-        card.querySelector("img[data-src-pb]") ||
-        card.querySelector('img[src*="/images/"]');
-      let imageUrl = (img && (img.getAttribute("data-src-pb") || img.getAttribute("src") || img.src)) || "";
-      if (imageUrl && imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
+      // картинка: WB меняет разметку и лениво грузит миниатюры — собираем со
+      // всех img/bg в карточке (cardImage), маркер /<nm>/images/ отсекает рекламу
+      const imageUrl = cardImage(card, nmId);
 
       products.push({
         id: nmId,
@@ -403,6 +512,8 @@
         seller: api ? api.supplier || "" : "",
         promo_id: api ? api.promo_id || 0 : 0,
         imageUrl,
+        sold_out: soldOut,
+        is_resale: isResale,
       });
     }
     lastSkipped = skipped;
@@ -507,7 +618,9 @@
     }
     const files = Number(st.files) || 0;
     const when = agoText(st.at);
-    if (st.ok) {
+    if (st.empty) {
+      setUI("warn", "Пусто", `WB не нашла товаров по этому запросу · ${when} · ↻ — пересобрать`);
+    } else if (st.ok) {
       setUI("ok", `✓ ${st.saved || 0} позиций`, `файлов: ${files} · ${when} · ↻ — пересобрать`);
     } else if (st.saved) {
       setUI("warn", `⚠ ${st.saved || 0} позиций`, `${st.error || "файлы не сохранены"} · ${when} · ↻ — пересобрать`);
@@ -534,6 +647,15 @@
     }
     const products = extract();
     if (!products.length) {
+      if (isEmptyResult()) {
+        // WB не нашла товаров по этому запросу — это ответ, а не «ещё грузится».
+        // Позиции не отправляем (чтобы не стереть ранее собранные данные),
+        // но состояние показываем явно.
+        const at = new Date().toISOString();
+        setUI("warn", "Пусто", "WB: по этому запросу ничего не найдено");
+        saveState({ at, ok: true, saved: 0, files: 0, empty: true, error: "" });
+        return null;
+      }
       if (manual) setUI("err", "Нет выдачи", "страница не похожа на выдачу");
       return null;
     }
@@ -547,6 +669,10 @@
       }
     }
     setUI("busy", "Сохраняем…", "");
+
+    // фото-диагностика: сколько карточек без картинки (пустой image_url)
+    const emptyImg = emptyCount(products);
+    if (emptyImg) console.log(`[SEARCH] миникартинок нет у ${emptyImg}/${products.length}`);
 
     const domRes = await send(products);
     const okDom = !!(domRes && domRes.ok);
@@ -567,6 +693,10 @@
       if (sentSig[key] === sigOf(part.raw || "")) files++;
       else rawErr = "файлы не все сохранены";
     }
+
+    // Запоминаем, сколько картинок не доехало — ретраем до 2 раз (armImageRetry)
+    lastSentEmpty = emptyImg;
+    if (okDom && emptyImg > 0) armImageRetry();
 
     const saved = products.length;
     const at = new Date().toISOString();
@@ -603,6 +733,95 @@
     }, 2000);
   }
 
+  // ===== Картинки: ожидание ленивых миниатюр + ретрай =====
+  // WB рисует миниатюры по мере рендера/прокрутки (lazy): чтобы не положить в
+  // базу выдачу с пустыми image_url, перед первым отправом ждём, пока доля
+  // пустых перестанет убывать (до ~3.5 с), а после отправа ещё до 2 раз досылаем
+  // апдейт, если картинок стало видно больше.
+  const IMG_STABLE_WAIT_MS = 3500;
+  let imgStable = { t0: 0, last: -1 };   // ожидание перед первым отправом
+  let lastSentEmpty = -1;                // сколько было пустых при прошлой отправке
+  let imgRetryTimer = null;
+  let imgRetryLeft = 0;                  // исполненных ретраев (максимум 2)
+
+  function emptyCount(products) {
+    let e = 0;
+    for (const p of products) if (!p.imageUrl) e++;
+    return e;
+  }
+
+  function imagesStable(products) {
+    if (!products.length) return true;
+    const empty = emptyCount(products);
+    if (empty === 0) return true;
+    if (!imgStable.t0) {
+      imgStable = { t0: Date.now(), last: empty };
+      return false;                      // первый пробег — дадим миниатюрам доехать
+    }
+    if (empty < imgStable.last && Date.now() - imgStable.t0 < IMG_STABLE_WAIT_MS) {
+      imgStable.last = empty;            // картинок стало больше — ждём дальше
+      return false;
+    }
+    return true;                         // прогресса нет или ждём слишком долго
+  }
+
+  function armImageRetry() {
+    if (imgRetryTimer || imgRetryLeft >= 2 || scrollRunning) return;
+    imgRetryTimer = setTimeout(() => {
+      imgRetryTimer = null;
+      imgRetryLeft++;
+      if (scrollRunning || !searchPage() || collectedPhrase !== phrase) return;
+      const products = extract();
+      if (!products.length) return;
+      const empty = emptyCount(products);
+      if (empty === 0 || empty >= lastSentEmpty) return;   // улучшения нет
+      console.log(`[SEARCH] ретрай картинок: пустых ${empty} из ${products.length}`);
+      collectNow();
+    }, IMG_STABLE_WAIT_MS);
+  }
+
+  // ===== Скролл-досбор картинок (командует background — только свои вкладки) =====
+  // WB лениво рисует миниатюры и грузит пагинацию только при прокрутке, поэтому
+  // фоновый поток после первого посыла держит вкладку и командует скролл до
+  // ТОП-N. По ходу новые страницы JSON ловятся через onSearchEnvelope; в конце —
+  // финальный апдейт (его background досохранит и закроет вкладку).
+  const SCROLL_TARGET_POS = 40;
+  let scrollRunning = false;
+
+  async function scrollCollect(maxMs = 9000) {
+    if (scrollRunning || !searchPage()) return;
+    scrollRunning = true;
+    const t0 = Date.now();
+    let lastPos = 0;
+    let stuck = 0;
+    console.log(`[SEARCH] скролл-досбор: цель позиция ${SCROLL_TARGET_POS}, окно ${maxMs} мс`);
+    try {
+      while (Date.now() - t0 < maxMs) {
+        const products = extract();
+        let maxPos = 0;
+        let emptyTop = 0;
+        for (const p of products) {
+          if (p.position > maxPos) maxPos = p.position;
+          if (p.position <= SCROLL_TARGET_POS && !p.imageUrl) emptyTop++;
+        }
+        if (maxPos >= SCROLL_TARGET_POS && emptyTop === 0) break;   // всё доехало
+        const before = window.scrollY;
+        window.scrollBy(0, Math.max(400, Math.round((window.innerHeight || 800) * 1.4)));
+        if (window.scrollY === before) {
+          if (maxPos <= lastPos) stuck++;
+          if (stuck >= 2) break;                       // доскроллили до дна
+        } else {
+          stuck = 0;
+        }
+        lastPos = maxPos;
+        await new Promise((r) => setTimeout(r, 450));
+      }
+    } catch {}
+    scrollRunning = false;
+    console.log(`[SEARCH] скролл-досбор: ${((Date.now() - t0) / 1000).toFixed(1)} с → апдейт`);
+    await collectNow();
+  }
+
   let attempts = 0;
   let captchaSent = false;
   let sent = false;
@@ -633,13 +852,17 @@
     if (collectedPhrase === phrase) return;
     attempts++;
     const products = extract();
-    const isEmpty = document.body.textContent.includes("Не нашлось подходящих товаров");
+    const isEmpty = isEmptyResult();
     if (!products.length && !isEmpty) {
       if (attempts > 15) attempts = 15;
       return;
     }
     // JSON-выдача WB приходит вместе с DOM — подождём её до 6 с, но не бесконечно
     if (products.length && !apiById.size && attempts < 6) return;
+    // Лениво нарисованные миниатюры: если картинок много пустых — даём до
+    // ~3.5 с, пока доля пустых перестанет убывать (imagesStable), иначе
+    // записали бы выдачу с пустыми image_url.
+    if (products.length && !scrollRunning && !imagesStable(products)) return;
 
     if (!phrase) phrase = pickPhrase();
     ensureStamp();
@@ -762,7 +985,7 @@
     if (stopBtn) stopBtn.style.display = "";
     const total = prog.total || 0;
     const done = prog.done || 0;
-    txt.textContent = total ? `Сбор ${done} из ${total}` : "Сбор…";
+    txt.textContent = total ? `Сбор ${done} · в очереди ${total}` : `Сбор ${done}`;
     bar.style.width = total ? `${Math.min(100, Math.round((done / total) * 100))}%` : "0%";
     cur.textContent = prog.current ? `сейчас: ${prog.current}` : "";
   }
@@ -798,6 +1021,11 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "WB_PROGRESS") renderProgressPlate(msg.prog || {});
+    // Скролл-досбор картинок: команду отправляет только background своим
+    // вкладкам фонового поиска — ручную вкладку человека не трогаем.
+    if (msg && msg.type === "WB_SEARCH_SCROLL") {
+      scrollCollect(Math.max(3000, Number(msg.maxMs) || 9000));
+    }
   });
 
   function syncUI() {

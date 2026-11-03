@@ -107,8 +107,47 @@
   }
 
   // ---------------- приём JSON ----------------
-  function shelfKey(kind, presetId) {
+  function shelfKey(kind, presetId, subjectId, parentSubjectId, dest) {
+    // У пресетов id достаточно (preset=583182238). У списка продавца
+    // (u-card/list) пресета нет — различаем по категории и региону, иначе
+    // разные списки на странице слиплись бы в один блок.
+    if (kind === "list") {
+      return `${kind}|0|${subjectId || 0}|${parentSubjectId || 0}|${dest || 0}`;
+    }
     return `${kind}|${presetId || 0}`;
+  }
+
+  // Метка момента в формате search_stamp: 20261027_162147.
+  function stampNow() {
+    const d = new Date();
+    const p = (n, w) => String(n).padStart(w || 2, "0");
+    return (
+      `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_` +
+      `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    );
+  }
+
+  // Сырой ответ полки — в background отдельным сообщением (background сам
+  // отправит его на /api/ext/shelves-raw, и сервер сохранит файл).
+  function sendRaw(env) {
+    try {
+      if (!chrome.runtime || !chrome.runtime.id) return;
+      chrome.runtime.sendMessage(
+        {
+          type: "WB_SHELF_RAW",
+          data: {
+            nm_id: cardNm || Number(env.nm_id) || 0,
+            url: env.url || "",
+            kind: env.kind || "recom",
+            raw: env.raw,
+            stamp: stampNow(),
+          },
+        },
+        () => void chrome.runtime.lastError
+      );
+    } catch (e) {
+      console.warn("[SHELF] сырой ответ не отправлен:", e);
+    }
   }
 
   function onEnvelope(env) {
@@ -119,10 +158,12 @@
     // Полки/дубликаты имеют смысл только на карточке; клипы — на любой странице WB.
     if (!cardNm && env.kind !== "clips") return;
 
-    if (env.kind === "list") {
-      // v4/list — не полка: нет preset_id, нет ранжирования. Для v1 не храним.
-      return;
+    // Сырой ответ полки карточки — отдельным сообщением в background (он
+    // уйдёт на сервер файлом). В общий payload полок он не влезает.
+    if ((env.kind === "recom" || env.kind === "list") && env.raw) {
+      sendRaw(env);
     }
+
     if (env.kind === "clips") {
       for (const c of env.clips || []) {
         if (c && c.clip_id) clips.set(c.clip_id, c);
@@ -138,7 +179,8 @@
   }
 
   function onRecom(env) {
-    const key = shelfKey(env.kind, env.preset_id);
+    const key = shelfKey(env.kind, env.preset_id, env.subject_id,
+                         env.parent_subject_id, env.dest);
     let s = shelves.get(key);
     if (!s) {
       s = {
@@ -224,136 +266,236 @@
     document.dispatchEvent(new Event("WB_SHELF_REPLAY_REQ"));
   } catch {}
 
-  // ---------------- DOM: подписи полок ----------------
-  function isVisible(el) {
+  // ---------------- DOM: подписи и фото полок ----------------
+  //
+  // Разметка WB (проверена на карточке 2026-10-28):
+  //   «См. также»            → section.cards-list > .goods-slider__header-wrap,
+  //                             карточки в .cards-list__container;
+  //   «Продавец рекомендует» → .product-page__seller-rec-new .premium-products__title,
+  //                             карточки в карусели рядом.
+  // Подпись блока — обычный DIV (не h2-h5), поэтому ищем по классам.
+  // Карточка блока: article[data-nm-id] (у «Продавец рекомендует») либо
+  // article[data-popup-nm-id] (у «См. также»).
+  const BLOCK_TITLE_SELECTORS = [
+    ".goods-slider__header-wrap",
+    ".premium-products__title",
+    ".subscribe-plane__title",
+  ];
+  const CARD_SELECTOR = "article[data-nm-id], article[data-popup-nm-id]";
+
+  function countCards(el) {
     try {
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
+      return el.querySelectorAll(CARD_SELECTOR).length;
     } catch {
-      return false;
+      return 0;
     }
   }
 
-  function nmLinksIn(box) {
-    const out = [];
-    const seen = new Set();
-    const links = box.querySelectorAll('a[href*="/catalog/"]');
-    for (const a of links) {
-      const n = nmOf(a);
-      if (!n || seen.has(n)) continue;
-      seen.add(n);
-      out.push(n);
+  // Контейнер карточек блока: следующий сосед заголовка (или его родителя),
+  // в котором уже есть >= MIN_DOM_NMS карточек.
+  function findBlockBox(hdr) {
+    let s = hdr.nextElementSibling;
+    for (let i = 0; i < 3 && s; i++, s = s.nextElementSibling) {
+      if (countCards(s) >= MIN_DOM_NMS) return s;
     }
-    return out;
-  }
-
-  function boxTitle(box) {
-    const h = box.querySelector("h1,h2,h3,h4,h5");
-    if (h) {
-      const t = clean(h.textContent);
-      if (t && t.length <= 80) return t;
-    }
-    const tEl = box.querySelector('[class*="title" i], [data-testid*="title" i]');
-    if (tEl) {
-      const t = clean(tEl.textContent);
-      if (t && t.length >= 3 && t.length <= 80) return t;
-    }
-    return "";
-  }
-
-  // Возвращает [{title, nms[]}] — только «настоящие» полки (>=4 карточек).
-  function domShelves() {
-    const boxes = [];
-    const seenBox = new Set();
-
-    const push = (el, nms) => {
-      if (!el || seenBox.has(el)) return;
-      if (nms.length < MIN_DOM_NMS || nms.length > 80) return;
-      seenBox.add(el);
-      boxes.push({ el, nms });
-    };
-
-    // 1) от заголовков: ближайший вверх контейнер, где уже есть >=4 карточек.
-    //    h1 не берём — это название самой карточки, а не подпись полки.
-    for (const h of document.querySelectorAll("h2,h3,h4,h5")) {
-      const t = clean(h.textContent);
-      if (!t || t.length < 3 || t.length > 80) continue;
-      if (h.closest("header, nav, footer, [role='dialog']")) continue;
-      if (!isVisible(h)) continue;
-      let el = h.parentElement;
-      for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
-        const nms = nmLinksIn(el);
-        if (nms.length >= MIN_DOM_NMS) {
-          push(el, nms);
-          break;
-        }
+    const p = hdr.parentElement;
+    if (p) {
+      s = p.nextElementSibling;
+      for (let i = 0; i < 3 && s; i++, s = s.nextElementSibling) {
+        if (countCards(s) >= MIN_DOM_NMS) return s;
       }
     }
+    return null;
+  }
 
-    // 2) запасной путь: контейнеры с характерным классом
-    const SEL =
-      '[class*="shelf" i], [class*="carousel" i], [class*="similar" i], [class*="recommend" i]';
-    let scanned = 0;
-    for (const el of document.querySelectorAll(SEL)) {
-      if (++scanned > 400) break;
-      const nms = nmLinksIn(el);
-      if (nms.length >= MIN_DOM_NMS) push(el, nms);
-    }
-
-    // 3) вложенные контейнеры выкидываем — остаётся самая узкая «полка»
+  // Карточки блока из DOM: nm, фото, бейджи, название, рейтинг, отзывы.
+  // В ответах WB фото и бейджей нет (проверено на сыром ответе каталога) —
+  // берём их здесь, из того, что реально показал WB.
+  function domCards(box) {
     const out = [];
-    const seenSig = new Set();
-    for (const b of boxes) {
-      if (boxes.some((o) => o !== b && b.el.contains(o.el))) continue;
-      // Полка рекомендаций не содержит саму карточку: если в контейнере есть
-      // ссылка на якорь — это блок товара/страница, а не полка.
-      if (b.nms.indexOf(cardNm) >= 0) continue;
-      const title = boxTitle(b.el) || clean(b.el.getAttribute("aria-label"));
-      if (!titleOk(title)) continue;
-      const sig = `${title}|${b.nms.slice(0, 5).join(",")}`;
-      if (seenSig.has(sig)) continue;
-      seenSig.add(sig);
-      out.push({ title: clamp(title, 120), nms: b.nms });
+    let arts = [];
+    try {
+      arts = box.querySelectorAll(CARD_SELECTOR);
+    } catch {
+      arts = [];
+    }
+    for (const art of arts) {
+      let nm = Number(art.getAttribute("data-nm-id") || art.getAttribute("data-popup-nm-id") || 0);
+      if (!nm) {
+        const a = art.querySelector('a[href*="/catalog/"]');
+        nm = a ? nmOf(a) : 0;
+      }
+      if (!nm) continue;
+      const img = art.querySelector("img.j-thumbnail") || art.querySelector("img");
+      const image_url = img
+        ? String(img.getAttribute("data-src-pb") || img.getAttribute("src") || "")
+        : "";
+      const badges = [];
+      for (const b of art.querySelectorAll("[data-testid='saleBadge'], [data-testid='feedbackBadge']")) {
+        const t = clean(b.innerText || b.textContent);
+        if (t && badges.indexOf(t) < 0) badges.push(t);
+      }
+      const text = (sel) => {
+        const el = art.querySelector(sel);
+        return el ? clean(el.innerText || el.textContent) : "";
+      };
+      out.push({
+        nm_id: nm,
+        position: Number(art.getAttribute("data-card-index") || 0) || 0,
+        image_url: image_url,
+        badges: badges,
+        name: text("[data-testid='productName']"),
+        price_text: text("[data-testid='product-card-current-price']"),
+        rating_text: text("[data-testid='catalogCardRating']"),
+        reviews_text: text("[data-testid='catalogCardCommentCount']"),
+      });
     }
     return out;
   }
+
+  // Блоки, найденные в DOM: [{el, title, cards, nms}]
+  function domShelves() {
+    const out = [];
+    const seenBox = new Set();
+    for (const sel of BLOCK_TITLE_SELECTORS) {
+      let heads = [];
+      try {
+        heads = document.querySelectorAll(sel);
+      } catch {
+        heads = [];
+      }
+      for (const hdr of heads) {
+        const title = clean(hdr.innerText || hdr.textContent);
+        if (!title || title.length > 60) continue;
+        const box = findBlockBox(hdr);
+        if (!box || seenBox.has(box)) continue;
+        seenBox.add(box);
+        const cards = domCards(box);
+        if (cards.length < MIN_DOM_NMS) continue;
+        out.push({ el: box, title, cards, nms: cards.map((c) => c.nm_id) });
+      }
+    }
+    return out;
+  }
+
+  // Подпись блока не должна быть названием товара: внутри блока первым
+  // заголовком идёт h2 карточки — такие «подписи» попадали в словарь
+  // (например «Город Медиа Софт/Дневник садовода…» вместо «Смотрите также»).
+  function normText(s) {
+    return String(s || "")
+      .toLowerCase()
+      .replace(/ё/g, "е")
+      .replace(/[^\w\s]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isItemName(title, shelf) {
+    const t = normText(title);
+    if (!t || t.length < 4) return false;
+    for (const it of shelf.items.values()) {
+      const n = normText(it.name);
+      if (!n || n.length < 4) continue;
+      if (t === n || t.indexOf(n) >= 0 || n.indexOf(t) >= 0) return true;
+    }
+    return false;
+  }
+
+  // Последний найденный в DOM блок: подпись + карточки + к какому блоку API
+  // он подошёл (для файла dom_*.json и для привязки фото/бейджей).
+  let domBlocks = [];
 
   function assignTitles() {
     if (!cardNm) return false;
     const dom = domShelves();
+    domBlocks = dom;
     if (!dom.length) return false;
     let changed = false;
+
+    // Фото и бейджи — по nm из ВСЕХ найденных блоков: не зависит от того,
+    // удалось ли сопоставить блок с ответом API.
+    const byNm = new Map();
+    for (const d of dom) {
+      for (const c of d.cards) {
+        if (!byNm.has(c.nm_id)) byNm.set(c.nm_id, c);
+      }
+    }
     for (const s of shelves.values()) {
-      if (s.title || !s.items.size) continue;
-      const A = new Set(s.items.keys());
+      for (const it of s.items.values()) {
+        const c = byNm.get(it.nm_id);
+        if (!c) continue;
+        if (c.image_url && !it.image_url) {
+          it.image_url = c.image_url;
+          changed = true;
+        }
+        if (c.badges && c.badges.length && !(it.badges && it.badges.length)) {
+          it.badges = c.badges.slice(0, 6);
+          changed = true;
+        }
+      }
+    }
+
+    // Подписи блоков — по совпадению nm с позициями ответа API.
+    for (const d of dom) {
+      const D = new Set(d.nms);
       let best = null;
       let bestScore = 0;
-      for (const d of dom) {
-        const D = new Set(d.nms);
+      for (const s of shelves.values()) {
+        if (!s.items.size) continue;
+        const A = new Set(s.items.keys());
         let inter = 0;
         for (const nm of D) if (A.has(nm)) inter++;
         const score = D.size ? inter / D.size : 0;
         if (score > bestScore) {
           bestScore = score;
-          best = d;
+          best = s;
         }
       }
-      if (best && bestScore >= 0.5 && titleOk(best.title)) {
-        s.title = best.title;
-        s.title_source = "dom";
-        learn(s.preset_id, best.title, bestScore);
-        changed = true;
-      }
+      d.shelf = best || null;
+      d.preset_id = best ? Number(best.preset_id) || 0 : 0;
+      d.kind = best ? best.kind : "";
+      if (!best || bestScore < 0.5) continue;
+      if (best.title) continue;
+      if (!titleOk(d.title)) continue;
+      if (isItemName(d.title, best)) continue;
+      best.title = d.title;
+      best.title_source = "dom";
+      learn(best.preset_id, d.title, bestScore);
+      changed = true;
     }
     if (changed) {
       saveDict();
       scheduleSend();
       console.log(
         "[SHELF] DOM-подписи:",
-        [...shelves.values()].map((s) => `${s.preset_id}:${s.title || "?"}`).join(" | ")
+        [...shelves.values()].map((s) => `${s.kind}:${s.preset_id}:${s.title || "?"}`).join(" | ")
       );
     }
     return changed;
+  }
+
+  // Блоки, как мы их увидели в DOM (для файла dom_*.json на сервере).
+  function domBlocksPayload() {
+    if (!domBlocks.length) {
+      // Скан ещё не шёл — запускаем (он же сопоставит блоки с ответами API
+      // и проставит kind/preset_id).
+      assignTitles();
+    }
+    return domBlocks.map((d) => ({
+      title: d.title || "",
+      kind: d.kind || "",
+      preset_id: d.preset_id || 0,
+      cards: (d.cards || []).map((c) => ({
+        nm_id: c.nm_id,
+        position: c.position || 0,
+        image_url: c.image_url || "",
+        badges: c.badges || [],
+        name: c.name || "",
+        price_text: c.price_text || "",
+        rating_text: c.rating_text || "",
+        reviews_text: c.reviews_text || "",
+      })),
+    }));
   }
 
   function scheduleScan() {
@@ -376,6 +518,24 @@
       { passive: true }
     );
   }
+
+  // content.js (сбор карточки) просит пересканировать DOM и отправить полки
+  // СРАЗУ: вкладку закрывает background сразу после отчёта о сборе, а отправка
+  // с паузой 1,5 с в неё не успевала — подписи блоков и фото терялись.
+  window.addEventListener("wbcm-shelf-scan", () => {
+    try {
+      assignTitles();
+      doSend();
+    } catch (e) {
+      console.warn("[SHELF] пересказ не удался:", e);
+    }
+    try {
+      window.dispatchEvent(new CustomEvent("wbcm-shelf-scan-done"));
+    } catch {}
+  });
+  try {
+    window.__WB_SHELF_READY__ = true;
+  } catch {}
 
   // ---------------- отправка ----------------
   // Реальные ссылки на клипы из DOM: WB рисует <a href="https://wibes.ru/clips/<id>">.
@@ -456,6 +616,9 @@
       dest: dest || 0,
       spp: spp == null ? null : spp,
       page_url: clamp(location.href, 500),
+      stamp: stampNow(),
+      // Блоки, как мы их увидели в DOM (сервер сохранит их файлом dom_*.json).
+      dom_blocks: domBlocksPayload(),
       shelves: list,
       offers: runList,
       clips: clipList,
@@ -475,7 +638,12 @@
     // min_price обновился) — поэтому в отпечаток входят и они.
     const titles = payload.shelves.map((s) => `${s.preset_id}:${s.title}`).join(",");
     const minima = payload.offers.map((o) => `${o.match_id}:${o.min_price}`).join(",");
-    const hash = `${payload.shelves.length}|${count}|${payload.offers.length}|${payload.clips.length}|${payload.clips.filter((c) => c.public_url).length}|${titles}|${minima}`;
+    // DOM-блоки тоже в отпечаток: они меняются (дорисовка карусели), а без них
+    // сервер не перезапишет файл dom_*.json.
+    const domSig = (payload.dom_blocks || [])
+      .map((b) => `${b.title}:${(b.cards || []).length}`)
+      .join(",");
+    const hash = `${payload.shelves.length}|${count}|${payload.offers.length}|${payload.clips.length}|${payload.clips.filter((c) => c.public_url).length}|${titles}|${minima}|${domSig}`;
     if (hash === lastSent) return;
     lastSent = hash;
 

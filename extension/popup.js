@@ -1,4 +1,4 @@
-const DEFAULT_SERVER = "http://31.130.204.146:8000";
+const DEFAULT_SERVER = "https://www.selbi.top";
 
 const statusEl = document.getElementById("status");
 const seedBtn = document.getElementById("seedBtn");
@@ -9,6 +9,15 @@ const collectModeEl = document.getElementById("collectMode");
 const serverInput = document.getElementById("serverInput");
 const tokenInput = document.getElementById("tokenInput");
 const saveSettingsBtn = document.getElementById("saveSettingsBtn");
+const gapSearchMinEl = document.getElementById("gapSearchMin");
+const gapSearchMaxEl = document.getElementById("gapSearchMax");
+const gapEnrichMinEl = document.getElementById("gapEnrichMin");
+const gapEnrichMaxEl = document.getElementById("gapEnrichMax");
+const gapDefaultsBtn = document.getElementById("gapDefaultsBtn");
+const gapErrEl = document.getElementById("gapErr");
+
+// Дефолты пауз, сек — согласованы с GAP_DEFAULTS в background.js
+const GAP_DEFAULTS_POPUP = { gapSearchMin: 9, gapSearchMax: 16, gapEnrichMin: 5, gapEnrichMax: 10 };
 
 const searchStatusEl = document.getElementById("searchStatus");
 const searchStartBtn = document.getElementById("searchStartBtn");
@@ -152,6 +161,12 @@ async function loadSettingsIntoForm() {
   const s = await settings();
   if (serverInput) serverInput.value = s.server;
   if (tokenInput && !tokenInput.value) tokenInput.value = s.token;
+  const g = await chrome.storage.local.get(GAP_DEFAULTS_POPUP);
+  gapSearchMinEl.value = g.gapSearchMin;
+  gapSearchMaxEl.value = g.gapSearchMax;
+  gapEnrichMinEl.value = g.gapEnrichMin;
+  gapEnrichMaxEl.value = g.gapEnrichMax;
+  gapErrEl.textContent = "";
   await loadFilters(s.categoryId);
 }
 
@@ -178,13 +193,45 @@ categorySelect.onchange = async () => {
   try { await chrome.storage.local.set({ categoryId: categorySelect.value || "" }); } catch {}
 };
 
+// Пара пауз «от/до»: целые ≥ 1, от ≤ до. Невалидная пара → дефолты.
+function gapPair(minEl, maxEl, key) {
+  let mn = Math.round(Number(minEl.value));
+  let mx = Math.round(Number(maxEl.value));
+  if (!isFinite(mn) || mn < 1 || !isFinite(mx) || mx < mn) {
+    mn = GAP_DEFAULTS_POPUP[key + "Min"];
+    mx = GAP_DEFAULTS_POPUP[key + "Max"];
+    minEl.value = mn;
+    maxEl.value = mx;
+    return { mn, mx, bad: true };
+  }
+  return { mn, mx, bad: false };
+}
+
 saveSettingsBtn.onclick = async () => {
+  const search = gapPair(gapSearchMinEl, gapSearchMaxEl, "gapSearch");
+  const enrich = gapPair(gapEnrichMinEl, gapEnrichMaxEl, "gapEnrich");
+  gapErrEl.textContent = search.bad || enrich.bad
+    ? "Паузы: целые числа ≥ 1 сек, «от» ≤ «до». Неверные значения заменены дефолтами."
+    : "";
   await chrome.storage.local.set({
     server: (serverInput.value || "").trim() || DEFAULT_SERVER,
     extToken: (tokenInput.value || "").trim(),
+    gapSearchMin: search.mn,
+    gapSearchMax: search.mx,
+    gapEnrichMin: enrich.mn,
+    gapEnrichMax: enrich.mx,
   });
   await refreshStatus();
   await refreshSearchStatus();
+};
+
+gapDefaultsBtn.onclick = async () => {
+  gapSearchMinEl.value = GAP_DEFAULTS_POPUP.gapSearchMin;
+  gapSearchMaxEl.value = GAP_DEFAULTS_POPUP.gapSearchMax;
+  gapEnrichMinEl.value = GAP_DEFAULTS_POPUP.gapEnrichMin;
+  gapEnrichMaxEl.value = GAP_DEFAULTS_POPUP.gapEnrichMax;
+  gapErrEl.textContent = "";
+  await chrome.storage.local.set(GAP_DEFAULTS_POPUP);
 };
 
 function setProgress(id, done, total) {
@@ -204,15 +251,17 @@ function statusRows(el, rows) {
 async function refreshStatus() {
   try {
     const v = nmInput.value.trim();
+    const mode = collectModeEl ? collectModeEl.value : "new";
+    // «SEO-мониторинг» — отдельная очередь (source='watch'), счётчики свои
     let url = `/api/ext/status`;
-    if (v) url += `?nm_id=${v}`;
+    if (mode === "watch") url += `?source=watch`;
+    if (v) url += `${url.includes("?") ? "&" : "?"}nm_id=${v}`;
     const r = await api(url);
     if (r.status === 401 || r.status === 403) {
       statusEl.innerHTML = "Нет доступа: проверьте токен в ⚙";
       return;
     }
     const d = await r.json();
-    const mode = collectModeEl ? collectModeEl.value : "new";
     const pending = d.pending || 0;
     const need = d.need_update || 0;
     const processing = d.processing || 0;
@@ -223,6 +272,7 @@ async function refreshStatus() {
       ["В работе", processing, "pending"],
       ["Обработано", d.done || 0, "done"],
       ["Ошибки", d.error || 0, "error"],
+      ["Нет на WB", d.gone || 0, "error"],
     ]);
     startBtn.disabled = mode === "refresh"
       ? need === 0
@@ -393,9 +443,10 @@ function etaText(prog) {
 
 function progressLine(prog, mode) {
   if (!prog || prog.mode !== mode) return "";
-  if (prog.finished) return `Готово: обработано ${prog.done || 0} из ${prog.total || 0}`;
+  if (prog.finished) return `Готово: обработано ${prog.done || 0}`;
   const parts = [];
-  if (prog.total) parts.push(`обработано ${prog.done || 0} из ${prog.total}`);
+  parts.push(`обработано ${prog.done || 0}`);
+  if (prog.total) parts.push(`в очереди ${prog.total}`);
   if (prog.current) parts.push(`сейчас: ${prog.current}`);
   const eta = etaText(prog);
   if (eta) parts.push(eta);
